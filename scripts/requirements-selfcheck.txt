@@ -1,0 +1,9 @@
+-r ../backend/requirements.txt
+
+# Extra deps used only by scripts/verify_video_call.py, to simulate two
+# app instances placing a real WebRTC call without needing MongoDB,
+# Android/iOS, or a real device/camera.
+mongomock-motor
+aiortc
+websockets
+requests

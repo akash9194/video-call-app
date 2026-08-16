@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Video Call - Browser Test Client</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #0f172a;
+    color: white;
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 24px;
+    width: 360px;
+    max-width: 100%;
+  }
+  input {
+    width: 100%;
+    padding: 10px;
+    margin-bottom: 10px;
+    border-radius: 8px;
+    border: none;
+    background: #0f172a;
+    color: white;
+    font-size: 14px;
+  }
+  button {
+    width: 100%;
+    padding: 12px;
+    border-radius: 8px;
+    border: none;
+    background: #2563eb;
+    color: white;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    margin-top: 6px;
+  }
+  button.secondary { background: #334155; }
+  button.danger { background: #dc2626; }
+  button.success { background: #16a34a; }
+  .link { color: #93c5fd; text-align: center; margin-top: 12px; cursor: pointer; font-size: 13px; }
+  .row { display: flex; justify-content: space-between; align-items: center; background: #0f172a; padding: 12px; border-radius: 8px; margin-bottom: 8px; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .config { font-size: 11px; color: #64748b; margin-bottom: 16px; }
+  .config input { font-size: 11px; padding: 6px; margin-bottom: 4px; }
+  #call-screen { display: none; position: fixed; inset: 0; background: black; }
+  #call-screen video { width: 100%; height: 100%; object-fit: cover; }
+  #local-video { position: absolute; width: 130px; height: 180px; top: 20px; right: 16px; border-radius: 12px; background: #1e293b; object-fit: cover; z-index: 2; }
+  #call-topbar { position: absolute; top: 20px; left: 16px; z-index: 2; }
+  #call-controls { position: absolute; bottom: 40px; left: 0; right: 0; display: flex; justify-content: center; gap: 20px; z-index: 2; }
+  .ctrl-btn { width: auto; padding: 14px 20px; border-radius: 30px; background: rgba(255,255,255,0.15); }
+  #incoming-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); align-items: center; justify-content: center; flex-direction: column; gap: 16px; z-index: 10; }
+  .avatar { width: 72px; height: 72px; border-radius: 50%; background: #2563eb; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 700; }
+</style>
+</head>
+<body>
+
+<div id="auth-view" class="card">
+  <div class="config">
+    <div>Backend URL</div>
+    <input id="api-base" value="http://localhost:8000" />
+  </div>
+  <h2 id="auth-title" style="margin-top:0">Log in</h2>
+  <input id="signup-name" placeholder="Name" style="display:none" />
+  <input id="email" placeholder="Email" />
+  <input id="password" type="password" placeholder="Password" />
+  <div id="auth-error" style="color:#f87171; font-size:13px; display:none; margin-bottom:8px"></div>
+  <button id="auth-submit" onclick="submitAuth()">Log in</button>
+  <div class="link" onclick="toggleAuthMode()" id="auth-toggle">Don't have an account? Sign up</div>
+</div>
+
+<div id="home-view" class="card" style="display:none">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px">
+    <h3 style="margin:0" id="home-title"></h3>
+    <span class="link" onclick="logout()" style="margin:0">Log out</span>
+  </div>
+  <div id="user-list"></div>
+</div>
+
+<div id="incoming-modal">
+  <div class="avatar" id="incoming-avatar"></div>
+  <div id="incoming-name" style="font-size:18px; font-weight:600"></div>
+  <div style="color:#94a3b8; font-size:13px" id="incoming-media-label">Incoming video call...</div>
+  <div style="display:flex; gap:16px; margin-top:12px">
+    <button class="danger" style="width:100px; border-radius:30px" onclick="rejectCall()">Decline</button>
+    <button class="success" style="width:100px; border-radius:30px" onclick="acceptCall()">Accept</button>
+  </div>
+</div>
+
+<div id="call-screen">
+  <video id="remote-video" autoplay playsinline></video>
+  <div id="remote-placeholder" style="position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:8px">
+    <div class="avatar" id="remote-avatar" style="width:88px; height:88px; font-size:32px"></div>
+    <div style="color:#94a3b8; font-size:14px" id="remote-placeholder-text">Voice call</div>
+  </div>
+  <video id="local-video" autoplay playsinline muted></video>
+  <div id="call-topbar">
+    <div id="call-peer-name" style="font-weight:600"></div>
+    <div id="call-status" style="color:#94a3b8; font-size:13px"></div>
+  </div>
+  <div id="call-controls">
+    <button class="ctrl-btn" onclick="toggleMute()" id="mute-btn">Mute</button>
+    <button class="ctrl-btn danger" style="border-radius:30px" onclick="endCall()">End</button>
+    <button class="ctrl-btn" onclick="handleSwitchClick()" id="switch-btn">Switch to video</button>
+  </div>
+</div>
+
+<script>
+// ---- state ----
+let apiBase = document.getElementById('api-base').value;
+let token = null, me = null, ws = null;
+let authMode = 'login';
+let callId = null, otherId = null, otherName = null;
+let pc = null, localStream = null, isMuted = false;
+let initialMedia = 'video'; // how the current call started -- set by placeCall or call:incoming
+let isVideoOn = false;      // do we currently have a live local video track in this call?
+let isRemoteVideoOn = false;
+let usersPollTimer = null;
+
+function wsBase() { return apiBase.replace(/^http/, 'ws'); }
+
+// ---- auth ----
+function toggleAuthMode() {
+  authMode = authMode === 'login' ? 'signup' : 'login';
+  document.getElementById('auth-title').textContent = authMode === 'login' ? 'Log in' : 'Sign up';
+  document.getElementById('signup-name').style.display = authMode === 'signup' ? 'block' : 'none';
+  document.getElementById('auth-submit').textContent = authMode === 'login' ? 'Log in' : 'Sign up';
+  document.getElementById('auth-toggle').textContent = authMode === 'login' ? "Don't have an account? Sign up" : 'Already have an account? Log in';
+  document.getElementById('auth-error').style.display = 'none';
+}
+
+async function submitAuth() {
+  apiBase = document.getElementById('api-base').value.replace(/\/$/, '');
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  const errEl = document.getElementById('auth-error');
+  errEl.style.display = 'none';
+  try {
+    let resp;
+    if (authMode === 'signup') {
+      const name = document.getElementById('signup-name').value.trim();
+      resp = await fetch(apiBase + '/auth/signup', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, email, password, role: 'freelancer' }),
+      });
+    } else {
+      resp = await fetch(apiBase + '/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+    }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || ('Request failed: ' + resp.status));
+    }
+    const data = await resp.json();
+    token = data.access_token;
+    me = data.user;
+    enterHome();
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.style.display = 'block';
+  }
+}
+
+function logout() {
+  if (ws) ws.close();
+  if (usersPollTimer) clearInterval(usersPollTimer);
+  token = null; me = null;
+  document.getElementById('home-view').style.display = 'none';
+  document.getElementById('auth-view').style.display = 'block';
+}
+
+// ---- home / contacts ----
+function enterHome() {
+  document.getElementById('auth-view').style.display = 'none';
+  document.getElementById('home-view').style.display = 'block';
+  document.getElementById('home-title').textContent = 'Hi, ' + me.name;
+  connectSignaling();
+  loadUsers();
+  usersPollTimer = setInterval(loadUsers, 3000);
+}
+
+async function loadUsers() {
+  try {
+    const resp = await fetch(apiBase + '/users', { headers: { Authorization: 'Bearer ' + token } });
+    const users = await resp.json();
+    const list = document.getElementById('user-list');
+    list.innerHTML = '';
+    if (users.length === 0) {
+      list.innerHTML = '<div style="color:#64748b; font-size:13px; text-align:center; padding:12px">No other users yet - sign up a second account in another tab.</div>';
+    }
+    users.forEach(u => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const disabledAttr = u.is_online ? '' : 'disabled style="opacity:0.4"';
+      const safeName = u.name.replace(/'/g, "");
+      row.innerHTML =
+        '<div><div style="font-weight:600; font-size:14px">' + u.name + '</div>' +
+        '<div style="font-size:12px; color:#94a3b8"><span class="status-dot" style="background:' + (u.is_online ? '#22c55e' : '#64748b') + '"></span>' + (u.is_online ? 'Online' : 'Offline') + '</div></div>' +
+        '<div style="display:flex; gap:6px">' +
+        '<button style="width:auto; padding:8px 12px; background:#2563eb" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'audio\')">Voice</button>' +
+        '<button style="width:auto; padding:8px 12px" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'video\')">Video</button>' +
+        '</div>';
+      list.appendChild(row);
+    });
+  } catch (e) { console.warn('loadUsers failed', e); }
+}
+
+// ---- signaling ----
+function connectSignaling() {
+  ws = new WebSocket(wsBase() + '/ws/signaling?token=' + token);
+  ws.onmessage = (ev) => handleSignal(JSON.parse(ev.data));
+  ws.onclose = () => console.log('signaling closed');
+}
+function send(msg) { ws.send(JSON.stringify(msg)); }
+
+async function handleSignal(msg) {
+  console.log('recv', msg.type, msg);
+  switch (msg.type) {
+    case 'call:incoming':
+      callId = msg.call_id; otherId = msg.from; otherName = msg.from_name;
+      initialMedia = msg.media === 'audio' ? 'audio' : 'video';
+      document.getElementById('incoming-avatar').textContent = otherName[0].toUpperCase();
+      document.getElementById('incoming-name').textContent = otherName;
+      document.getElementById('incoming-media-label').textContent = 'Incoming ' + (initialMedia === 'audio' ? 'voice' : 'video') + ' call...';
+      document.getElementById('incoming-modal').style.display = 'flex';
+      break;
+    case 'call:accepted':
+      callId = msg.call_id;
+      document.getElementById('call-status').textContent = 'Connecting...';
+      await setupPeerConnection(initialMedia === 'video');
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      send({ type: 'webrtc:offer', call_id: callId, to: otherId, sdp: { type: offer.type, sdp: offer.sdp } });
+      break;
+    case 'webrtc:offer':
+      // If `pc` already exists, this is a mid-call renegotiation offer
+      // (the peer just switched video on) -- answer on the SAME
+      // connection, do not recreate it or touch our own local tracks.
+      // Only create a fresh connection if this is the very first offer
+      // for the call (we're the callee answering for the first time).
+      if (!pc) await setupPeerConnection(initialMedia === 'video');
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'webrtc:answer', call_id: msg.call_id, to: msg.from, sdp: { type: answer.type, sdp: answer.sdp } });
+      showCallScreen();
+      break;
+    case 'webrtc:answer':
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      showCallScreen();
+      break;
+    case 'webrtc:ice-candidate':
+      if (pc && msg.candidate && msg.candidate.candidate) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch (e) { console.warn(e); }
+      }
+      break;
+    case 'call:media-switch':
+      // Advance notice that the peer's outgoing video just turned
+      // on/off -- update our UI immediately rather than waiting on the
+      // renegotiation (if any) to land.
+      isRemoteVideoOn = msg.media === 'video';
+      updateRemoteVideoVisibility();
+      break;
+    case 'call:rejected':
+    case 'call:cancelled':
+    case 'call:ended':
+    case 'call:user-offline':
+      cleanupCall();
+      break;
+  }
+}
+
+// ---- call actions ----
+async function placeCall(id, name, media) {
+  callId = null; otherId = id; otherName = name;
+  initialMedia = media === 'audio' ? 'audio' : 'video';
+  send({ type: 'call:invite', to: id, media: initialMedia });
+  document.getElementById('call-peer-name').textContent = name;
+  document.getElementById('call-status').textContent = 'Calling...';
+  document.getElementById('call-screen').style.display = 'block';
+  isVideoOn = false; isRemoteVideoOn = false;
+  updateLocalVideoVisibility(); updateRemoteVideoVisibility(); updateSwitchButton();
+}
+
+async function acceptCall() {
+  document.getElementById('incoming-modal').style.display = 'none';
+  document.getElementById('call-peer-name').textContent = otherName;
+  document.getElementById('call-status').textContent = 'Connecting...';
+  document.getElementById('call-screen').style.display = 'block';
+  isRemoteVideoOn = false;
+  updateRemoteVideoVisibility();
+  await setupPeerConnection(initialMedia === 'video');
+  send({ type: 'call:accept', call_id: callId, to: otherId });
+}
+
+function rejectCall() {
+  send({ type: 'call:reject', call_id: callId, to: otherId });
+  document.getElementById('incoming-modal').style.display = 'none';
+  callId = null; otherId = null;
+}
+
+function endCall() {
+  if (callId && otherId) send({ type: 'call:end', call_id: callId, to: otherId });
+  cleanupCall();
+}
+
+async function setupPeerConnection(wantVideo) {
+  const iceResp = await fetch(apiBase + '/calls/ice-servers', { headers: { Authorization: 'Bearer ' + token } });
+  const { ice_servers } = await iceResp.json();
+  pc = new RTCPeerConnection({ iceServers: ice_servers });
+
+  localStream = await navigator.mediaDevices.getUserMedia({ video: !!wantVideo, audio: true });
+  document.getElementById('local-video').srcObject = localStream;
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  isVideoOn = !!wantVideo;
+  updateLocalVideoVisibility();
+  updateSwitchButton();
+
+  const remoteStream = new MediaStream();
+  document.getElementById('remote-video').srcObject = remoteStream;
+  pc.ontrack = (ev) => {
+    ev.streams[0].getTracks().forEach(t => {
+      remoteStream.addTrack(t);
+      if (t.kind === 'video') { isRemoteVideoOn = true; updateRemoteVideoVisibility(); }
+    });
+  };
+
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate) send({ type: 'webrtc:ice-candidate', call_id: callId, to: otherId, candidate: ev.candidate });
+  };
+  pc.onconnectionstatechange = () => {
+    document.getElementById('call-status').textContent = pc.connectionState;
+  };
+}
+
+function showCallScreen() {
+  document.getElementById('call-screen').style.display = 'block';
+}
+
+function updateLocalVideoVisibility() {
+  document.getElementById('local-video').style.display = isVideoOn ? 'block' : 'none';
+}
+
+function updateRemoteVideoVisibility() {
+  const showVideo = isRemoteVideoOn;
+  document.getElementById('remote-video').style.display = showVideo ? 'block' : 'none';
+  document.getElementById('remote-placeholder').style.display = showVideo ? 'none' : 'flex';
+  if (!showVideo) {
+    document.getElementById('remote-avatar').textContent = (otherName || '?')[0].toUpperCase();
+    document.getElementById('remote-placeholder-text').textContent = 'Voice call';
+  }
+}
+
+function updateSwitchButton() {
+  document.getElementById('switch-btn').textContent = isVideoOn ? 'Switch to voice' : 'Switch to video';
+}
+
+function handleSwitchClick() {
+  if (isVideoOn) switchToVoice(); else switchToVideo();
+}
+
+// Turning video ON: if a local video track already exists (this call
+// started as video, or we already switched to video once), just
+// re-enable it -- cheap, no renegotiation. If no local video track
+// exists at all (call started as audio-only), get the camera, add the
+// track, and renegotiate (a second offer/answer on the SAME connection).
+async function switchToVideo() {
+  if (!pc || !callId || !otherId) return;
+  const existing = localStream && localStream.getVideoTracks()[0];
+  if (existing) {
+    existing.enabled = true;
+    isVideoOn = true;
+    updateLocalVideoVisibility();
+    updateSwitchButton();
+    send({ type: 'call:media-switch', call_id: callId, to: otherId, media: 'video' });
+    return;
+  }
+
+  const camStream = await navigator.mediaDevices.getUserMedia({ video: true });
+  const videoTrack = camStream.getVideoTracks()[0];
+  if (!videoTrack) return;
+  pc.addTrack(videoTrack, camStream);
+  if (!localStream) localStream = camStream; else localStream.addTrack(videoTrack);
+  document.getElementById('local-video').srcObject = localStream;
+  isVideoOn = true;
+  updateLocalVideoVisibility();
+  updateSwitchButton();
+
+  send({ type: 'call:media-switch', call_id: callId, to: otherId, media: 'video' });
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  send({ type: 'webrtc:offer', call_id: callId, to: otherId, sdp: { type: offer.type, sdp: offer.sdp } });
+  // The answer comes back through the normal 'webrtc:answer' case above.
+}
+
+// Turning video OFF never removes the track or renegotiates -- just
+// disables it, so switching back to video later is instant.
+function switchToVoice() {
+  if (!callId || !otherId) return;
+  if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = false);
+  isVideoOn = false;
+  updateLocalVideoVisibility();
+  updateSwitchButton();
+  send({ type: 'call:media-switch', call_id: callId, to: otherId, media: 'audio' });
+}
+
+function cleanupCall() {
+  document.getElementById('incoming-modal').style.display = 'none';
+  document.getElementById('call-screen').style.display = 'none';
+  if (pc) { pc.close(); pc = null; }
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  callId = null; otherId = null; otherName = null;
+  isMuted = false; isVideoOn = false; isRemoteVideoOn = false;
+  document.getElementById('mute-btn').textContent = 'Mute';
+  updateSwitchButton();
+}
+
+function toggleMute() {
+  if (!localStream) return;
+  isMuted = !isMuted;
+  localStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
+  document.getElementById('mute-btn').textContent = isMuted ? 'Unmute' : 'Mute';
+}
+</script>
+</body>
+</html>

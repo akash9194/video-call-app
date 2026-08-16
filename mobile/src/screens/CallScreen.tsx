@@ -1,0 +1,105 @@
+import React from 'react';
+import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { RTCView } from 'react-native-webrtc';
+import { useCall } from '../context/CallContext';
+
+export default function CallScreen() {
+  const {
+    status,
+    remoteUserName,
+    localStream,
+    remoteStream,
+    isMuted,
+    isVideoOn,
+    isRemoteVideoOn,
+    endCall,
+    toggleMute,
+    switchToVideo,
+    switchToVoice,
+  } = useCall();
+
+  const showRemoteVideo = remoteStream && isRemoteVideoOn;
+
+  return (
+    <View style={styles.container}>
+      {showRemoteVideo ? (
+        <RTCView streamURL={remoteStream!.toURL()} style={styles.remoteVideo} objectFit="cover" />
+      ) : (
+        <View style={[styles.remoteVideo, styles.placeholder]}>
+          <View style={styles.avatar}>
+            <Text style={styles.avatarText}>{remoteUserName?.[0]?.toUpperCase() ?? '?'}</Text>
+          </View>
+          <Text style={styles.placeholderText}>
+            {status === 'connecting' ? 'Connecting…' : isRemoteVideoOn ? 'Waiting for video…' : 'Voice call'}
+          </Text>
+        </View>
+      )}
+
+      {localStream && isVideoOn && (
+        <RTCView streamURL={localStream.toURL()} style={styles.localVideo} objectFit="cover" zOrder={1} />
+      )}
+
+      <View style={styles.topBar}>
+        <Text style={styles.callerName}>{remoteUserName}</Text>
+        <Text style={styles.callStatus}>{status === 'active' ? 'Connected' : status}</Text>
+      </View>
+
+      <View style={styles.controls}>
+        <TouchableOpacity style={styles.controlButton} onPress={toggleMute}>
+          <Text style={styles.controlIcon}>{isMuted ? 'Unmute' : 'Mute'}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.controlButton, styles.endCall]} onPress={endCall}>
+          <Text style={styles.controlIcon}>End</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.controlButton} onPress={isVideoOn ? switchToVoice : switchToVideo}>
+          <Text style={styles.controlIcon}>{isVideoOn ? 'Switch to voice' : 'Switch to video'}</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: 'black' },
+  remoteVideo: { flex: 1 },
+  placeholder: { alignItems: 'center', justifyContent: 'center' },
+  avatar: {
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    backgroundColor: '#2563eb',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 12,
+  },
+  avatarText: { color: 'white', fontSize: 32, fontWeight: '700' },
+  placeholderText: { color: '#94a3b8', fontSize: 16 },
+  localVideo: {
+    position: 'absolute',
+    width: 110,
+    height: 150,
+    top: 50,
+    right: 16,
+    borderRadius: 12,
+    backgroundColor: '#1e293b',
+  },
+  topBar: { position: 'absolute', top: 50, left: 16 },
+  callerName: { color: 'white', fontSize: 20, fontWeight: '700' },
+  callStatus: { color: '#94a3b8', marginTop: 4, textTransform: 'capitalize' },
+  controls: {
+    position: 'absolute',
+    bottom: 48,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    justifyContent: 'space-evenly',
+  },
+  controlButton: {
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+    borderRadius: 30,
+  },
+  endCall: { backgroundColor: '#dc2626' },
+  controlIcon: { color: 'white', fontWeight: '600' },
+});

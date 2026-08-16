@@ -1,0 +1,16 @@
+# Version ranges (not exact pins) so pip can pick a build with a prebuilt
+# wheel for whatever Python version you have installed. Exact pins on
+# pydantic-core in particular tend to break on newer Python -- there's no
+# prebuilt wheel yet, so pip tries to compile it from source (needs a Rust
+# toolchain most machines don't have) and the install fails.
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0
+motor>=3.5,<4.0
+pymongo>=4.7,<5.0
+python-jose[cryptography]>=3.3,<4.0
+bcrypt>=4.0,<5.0
+python-dotenv>=1.0,<2.0
+pydantic[email]>=2.9,<3.0
+pydantic-settings>=2.5,<3.0
+python-multipart>=0.0.9,<0.1
+websockets>=12.0,<14.0
