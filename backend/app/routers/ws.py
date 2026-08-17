@@ -1,4 +1,5 @@
 import logging
+import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 
@@ -13,7 +14,7 @@ router = APIRouter()
 
 
 @router.websocket("/ws/signaling")
-async def signaling_endpoint(websocket: WebSocket, token: str = Query(...)):
+async def signaling_endpoint(websocket: WebSocket, token: str = Query(...), device_id: str | None = Query(default=None)):
     user_id = await get_user_id_from_token(token)
     if not user_id:
         await websocket.close(code=4401)  # custom code: unauthorized
@@ -24,7 +25,15 @@ async def signaling_endpoint(websocket: WebSocket, token: str = Query(...)):
         await websocket.close(code=4404)
         return
 
-    await manager.connect(user_id, websocket)
+    # Each physical connection (phone, tablet, browser tab, ...) gets its
+    # own device_id so the same account can be signed in on several devices
+    # at once without one connection silently evicting another. Clients may
+    # supply a stable one; if they don't, a per-connection id is generated
+    # here -- either way the important thing is it's unique among this
+    # user's concurrently-open connections.
+    connection_device_id = device_id or str(uuid.uuid4())
+
+    await manager.connect(user_id, connection_device_id, websocket)
     try:
         while True:
             message = await websocket.receive_json()
@@ -34,10 +43,10 @@ async def signaling_endpoint(websocket: WebSocket, token: str = Query(...)):
             # receiving calls) until the app reconnects. Only a real
             # disconnect should end this loop.
             try:
-                await handle_message(user_id, user["name"], message)
+                await handle_message(user_id, connection_device_id, user["name"], message)
             except Exception:
                 logger.exception("Error handling signaling message %r from user %s", message, user_id)
     except WebSocketDisconnect:
         pass
     finally:
-        await manager.disconnect(user_id)
+        await manager.disconnect(user_id, connection_device_id)

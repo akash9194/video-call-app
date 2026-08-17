@@ -19,6 +19,7 @@ export type SignalingMessage =
   | { type: 'call:accepted'; call_id: string; from: string }
   | { type: 'call:rejected'; call_id: string; from: string }
   | { type: 'call:cancelled'; call_id: string; from: string }
+  | { type: 'call:answered_elsewhere'; call_id: string; from: string }
   | { type: 'call:ended'; call_id: string; from: string }
   | { type: 'call:user-offline'; call_id: string }
   | { type: 'webrtc:offer'; call_id: string; from: string; sdp: any }

@@ -22,16 +22,17 @@ Protocol (all messages are JSON with a "type" field):
     call:media-switch   { call_id, to: userId, media: "audio" | "video" }
 
   Server -> Client
-    call:incoming        { call_id, from: userId, from_name, media: "audio" | "video" }
-    call:accepted         { call_id, from: userId }
-    call:rejected         { call_id, from: userId }
-    call:cancelled        { call_id, from: userId }
-    call:ended             { call_id, from: userId }
-    call:user-offline    { call_id }   (callee not connected)
+    call:incoming          { call_id, from: userId, from_name, media: "audio" | "video" }
+    call:accepted           { call_id, from: userId }
+    call:rejected           { call_id, from: userId }
+    call:cancelled          { call_id, from: userId }
+    call:answered_elsewhere { call_id, from: userId }  (sent to this user's OTHER devices)
+    call:ended               { call_id, from: userId }
+    call:user-offline      { call_id }   (callee not connected on any device)
     webrtc:offer / answer / ice-candidate  (relayed as-is)
-    call:media-switch    { call_id, from: userId, media: "audio" | "video" }  (relayed as-is)
-    presence:update       { user_id, is_online }
-    error                 { message }
+    call:media-switch      { call_id, from: userId, media: "audio" | "video" }  (relayed as-is)
+    presence:update         { user_id, is_online }
+    error                   { message }
 
 Switching between voice and video mid-call is NOT a new call -- it's a
 WebRTC renegotiation on the *existing* peer connection: the side that's
@@ -42,6 +43,19 @@ is purely an advance notice so the other side's UI can react immediately
 (e.g. swap to an avatar) without waiting on the renegotiation round-trip;
 this server does not need to understand or validate it, only relay it, the
 same as it does for the webrtc:* messages.
+
+Multi-device behaviour
+-----------------------
+A user can be signed in on several devices (phone, tablet, web) at once,
+each holding its own WebSocket connection. Presence is per-user (online if
+ANY device is connected). An incoming call rings on ALL of a user's
+connected devices at once (call:incoming is fanned out). Whichever device
+answers first "wins": the server records which (user_id, device_id) is
+actually party to that call_id, sends call:accepted only to the caller's
+device, and tells the callee's OTHER devices call:answered_elsewhere so
+they can dismiss their incoming-call screen. From that point on, every
+message for that call_id (webrtc:*, call:media-switch, call:end, ...) is
+routed only to the two pinned devices, never fanned out.
 """
 
 import uuid
@@ -55,30 +69,40 @@ from app.database import calls_collection, users_collection
 
 class ConnectionManager:
     def __init__(self):
-        # user_id -> WebSocket
-        self.active_connections: dict[str, WebSocket] = {}
+        # user_id -> { device_id -> WebSocket }
+        self.active_connections: dict[str, dict[str, WebSocket]] = {}
+        # call_id -> { "caller": (user_id, device_id), "callee": (user_id, device_id) | None }
+        self.call_participants: dict[str, dict[str, tuple[str, str] | None]] = {}
 
-    async def connect(self, user_id: str, websocket: WebSocket):
+    async def connect(self, user_id: str, device_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[user_id] = websocket
-        await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": True}})
-        await self.broadcast_presence(user_id, True)
+        was_offline = not self.active_connections.get(user_id)
+        self.active_connections.setdefault(user_id, {})[device_id] = websocket
+        if was_offline:
+            await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": True}})
+            await self.broadcast_presence(user_id, True)
 
-    async def disconnect(self, user_id: str):
-        self.active_connections.pop(user_id, None)
-        await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": False}})
-        await self.broadcast_presence(user_id, False)
+    async def disconnect(self, user_id: str, device_id: str):
+        devices = self.active_connections.get(user_id)
+        if devices:
+            devices.pop(device_id, None)
+            if not devices:
+                self.active_connections.pop(user_id, None)
+        if not self.active_connections.get(user_id):
+            await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": False}})
+            await self.broadcast_presence(user_id, False)
 
     async def broadcast_presence(self, user_id: str, is_online: bool):
         payload = {"type": "presence:update", "user_id": user_id, "is_online": is_online}
-        for ws in list(self.active_connections.values()):
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                pass
+        for devices in list(self.active_connections.values()):
+            for ws in list(devices.values()):
+                try:
+                    await ws.send_json(payload)
+                except Exception:
+                    pass
 
-    async def send_to_user(self, user_id: str, message: dict) -> bool:
-        ws = self.active_connections.get(user_id)
+    async def send_to_device(self, user_id: str, device_id: str, message: dict) -> bool:
+        ws = self.active_connections.get(user_id, {}).get(device_id)
         if not ws:
             return False
         try:
@@ -87,14 +111,42 @@ class ConnectionManager:
         except Exception:
             return False
 
+    async def send_to_all_devices(self, user_id: str, message: dict, exclude_device: str | None = None) -> bool:
+        devices = self.active_connections.get(user_id, {})
+        delivered = False
+        for device_id, ws in list(devices.items()):
+            if device_id == exclude_device:
+                continue
+            try:
+                await ws.send_json(message)
+                delivered = True
+            except Exception:
+                pass
+        return delivered
+
+    async def route(self, call_id: str, target_user_id: str, message: dict) -> bool:
+        """
+        Send `message` to `target_user_id` for a given call. If the call has
+        already pinned a specific device for that user (they're the caller,
+        or they already accepted as the callee), deliver only to that
+        device. Otherwise (e.g. callee hasn't answered yet) fan out to all
+        of their connected devices.
+        """
+        participants = self.call_participants.get(call_id)
+        if participants:
+            for entry in (participants.get("caller"), participants.get("callee")):
+                if entry and entry[0] == target_user_id:
+                    return await self.send_to_device(target_user_id, entry[1], message)
+        return await self.send_to_all_devices(target_user_id, message)
+
     def is_online(self, user_id: str) -> bool:
-        return user_id in self.active_connections
+        return bool(self.active_connections.get(user_id))
 
 
 manager = ConnectionManager()
 
 
-async def handle_message(sender_id: str, sender_name: str, message: dict):
+async def handle_message(sender_id: str, sender_device_id: str, sender_name: str, message: dict):
     msg_type = message.get("type")
 
     if msg_type == "call:invite":
@@ -103,6 +155,11 @@ async def handle_message(sender_id: str, sender_name: str, message: dict):
         if media not in ("audio", "video"):
             media = "video"
         call_id = str(uuid.uuid4())
+
+        # Pin the caller's device now -- everything for this call_id that's
+        # addressed back to the caller (accepted/rejected/webrtc/...) must
+        # land on this specific device, not fan out to their other devices.
+        manager.call_participants[call_id] = {"caller": (sender_id, sender_device_id), "callee": None}
 
         await calls_collection.insert_one(
             {
@@ -118,7 +175,8 @@ async def handle_message(sender_id: str, sender_name: str, message: dict):
             }
         )
 
-        delivered = await manager.send_to_user(
+        # Ring every device the callee is connected on.
+        delivered = await manager.send_to_all_devices(
             callee_id,
             {
                 "type": "call:incoming",
@@ -130,28 +188,46 @@ async def handle_message(sender_id: str, sender_name: str, message: dict):
         )
         if not delivered:
             await calls_collection.update_one({"call_id": call_id}, {"$set": {"status": "missed"}})
-            await manager.send_to_user(sender_id, {"type": "call:user-offline", "call_id": call_id})
+            await manager.send_to_device(sender_id, sender_device_id, {"type": "call:user-offline", "call_id": call_id})
+            manager.call_participants.pop(call_id, None)
         return
 
     if msg_type == "call:accept":
         call_id = message["call_id"]
+        participants = manager.call_participants.get(call_id)
+        # First device to accept wins. Pin this device as the callee for
+        # the rest of the call, and tell any other devices of this same
+        # user that they were beaten to it so they can dismiss the
+        # incoming-call screen.
+        if participants and participants.get("callee") is None:
+            participants["callee"] = (sender_id, sender_device_id)
+            await manager.send_to_all_devices(
+                sender_id,
+                {"type": "call:answered_elsewhere", "call_id": call_id, "from": sender_id},
+                exclude_device=sender_device_id,
+            )
         await calls_collection.update_one(
             {"call_id": call_id},
             {"$set": {"status": "active", "started_at": datetime.now(timezone.utc)}},
         )
-        await manager.send_to_user(message["to"], {"type": "call:accepted", "call_id": call_id, "from": sender_id})
+        await manager.route(call_id, message["to"], {"type": "call:accepted", "call_id": call_id, "from": sender_id})
         return
 
     if msg_type == "call:reject":
         call_id = message["call_id"]
         await calls_collection.update_one({"call_id": call_id}, {"$set": {"status": "rejected"}})
-        await manager.send_to_user(message["to"], {"type": "call:rejected", "call_id": call_id, "from": sender_id})
+        await manager.route(call_id, message["to"], {"type": "call:rejected", "call_id": call_id, "from": sender_id})
+        manager.call_participants.pop(call_id, None)
         return
 
     if msg_type == "call:cancel":
         call_id = message["call_id"]
         await calls_collection.update_one({"call_id": call_id}, {"$set": {"status": "cancelled"}})
-        await manager.send_to_user(message["to"], {"type": "call:cancelled", "call_id": call_id, "from": sender_id})
+        # Not yet accepted (or already pinned, route() handles both) -- if
+        # still pre-accept this correctly fans out to every device that was
+        # ringing so they all stop.
+        await manager.route(call_id, message["to"], {"type": "call:cancelled", "call_id": call_id, "from": sender_id})
+        manager.call_participants.pop(call_id, None)
         return
 
     if msg_type == "call:end":
@@ -162,14 +238,16 @@ async def handle_message(sender_id: str, sender_name: str, message: dict):
             duration = (update["ended_at"] - call["started_at"]).total_seconds()
             update["duration_seconds"] = int(duration)
         await calls_collection.update_one({"call_id": call_id}, {"$set": update})
-        await manager.send_to_user(message["to"], {"type": "call:ended", "call_id": call_id, "from": sender_id})
+        await manager.route(call_id, message["to"], {"type": "call:ended", "call_id": call_id, "from": sender_id})
+        manager.call_participants.pop(call_id, None)
         return
 
     if msg_type in ("webrtc:offer", "webrtc:answer", "webrtc:ice-candidate", "call:media-switch"):
-        # Relay untouched to the other peer. call:media-switch is just an
-        # advance notice for the UI; the real change happens via the
-        # webrtc:offer/answer renegotiation the client sends alongside it.
-        await manager.send_to_user(message["to"], {**message, "from": sender_id})
+        # Relay untouched to the other peer's pinned device. call:media-switch
+        # is just an advance notice for the UI; the real change happens via
+        # the webrtc:offer/answer renegotiation the client sends alongside it.
+        call_id = message.get("call_id")
+        await manager.route(call_id, message["to"], {**message, "from": sender_id})
         return
 
-    await manager.send_to_user(sender_id, {"type": "error", "message": f"Unknown message type: {msg_type}"})
+    await manager.send_to_device(sender_id, sender_device_id, {"type": "error", "message": f"Unknown message type: {msg_type}"})

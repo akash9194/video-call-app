@@ -278,6 +278,10 @@ async function handleSignal(msg) {
     case 'call:cancelled':
     case 'call:ended':
     case 'call:user-offline':
+    case 'call:answered_elsewhere':
+      // answered_elsewhere means this same account accepted the call in
+      // another tab/device -- this tab was one of several that rang and
+      // lost, so just dismiss quietly like any other "not happening here".
       cleanupCall();
       break;
   }

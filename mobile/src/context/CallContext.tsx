@@ -294,7 +294,12 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         case 'call:rejected':
         case 'call:cancelled':
         case 'call:ended':
-        case 'call:user-offline': {
+        case 'call:user-offline':
+        case 'call:answered_elsewhere': {
+          // call:answered_elsewhere means this same account accepted the
+          // call on a different device (phone/tablet/web) -- this device
+          // was one of several that rang, and lost. Just dismiss quietly,
+          // same as any other "this call isn't happening here" case.
           InCallManager.stopRingtone();
           resetCallState();
           navigate('Home');
