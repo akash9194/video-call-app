@@ -3,18 +3,22 @@ import { View, Text, FlatList, TouchableOpacity, StyleSheet, RefreshControl } fr
 import { useAuth } from '../context/AuthContext';
 import { useCall } from '../context/CallContext';
 import { api } from '../services/api';
-import { User } from '../types';
+import { User, Appointment } from '../types';
+import { NavProp } from '../navigation';
 
-export default function HomeScreen() {
+export default function HomeScreen({ navigation }: { navigation: NavProp }) {
   const { user, logout } = useAuth();
   const { startCall } = useCall();
   const [users, setUsers] = useState<User[]>([]);
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
     setRefreshing(true);
     try {
-      setUsers(await api.listUsers());
+      const [u, a] = await Promise.all([api.listUsers(), api.listAppointments()]);
+      setUsers(u);
+      setAppointments(a);
     } finally {
       setRefreshing(false);
     }
@@ -62,6 +66,12 @@ export default function HomeScreen() {
               {canCallThisUser && (
                 <View style={{ flexDirection: 'row', gap: 8 }}>
                   <TouchableOpacity
+                    style={styles.scheduleButton}
+                    onPress={() => navigation.navigate('Schedule', { patientId: item.id, patientName: item.name })}
+                  >
+                    <Text style={styles.scheduleButtonText}>Schedule</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
                     style={[styles.callButton, styles.voiceButton, !item.is_online && styles.callButtonDisabled]}
                     disabled={!item.is_online}
                     onPress={() => startCall(item.id, item.name, 'audio')}
@@ -80,6 +90,22 @@ export default function HomeScreen() {
             </View>
           );
         }}
+        ListHeaderComponent={
+          appointments.length > 0 ? (
+            <View style={styles.apptSection}>
+              <Text style={styles.apptHeading}>Your appointments</Text>
+              {appointments.map((a) => (
+                <View key={a.id} style={styles.apptRow}>
+                  <Text style={styles.apptWith}>{user?.role === 'doctor' ? a.patient_name : a.doctor_name}</Text>
+                  <Text style={styles.apptWhen}>{new Date(a.scheduled_time).toLocaleString()}</Text>
+                  <Text style={[styles.apptStatus, a.status === 'scheduled' ? styles.apptStatusActive : styles.apptStatusInactive]}>
+                    {a.status}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          ) : null
+        }
         ListEmptyComponent={<Text style={styles.empty}>No other users yet.</Text>}
       />
     </View>
@@ -107,5 +133,23 @@ const styles = StyleSheet.create({
   voiceButton: { backgroundColor: '#2563eb' },
   callButtonDisabled: { backgroundColor: '#334155' },
   callButtonText: { color: 'white', fontWeight: '600' },
+  scheduleButton: { backgroundColor: '#334155', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8 },
+  scheduleButtonText: { color: 'white', fontSize: 12, fontWeight: '600' },
   empty: { color: '#94a3b8', textAlign: 'center', marginTop: 40 },
+  apptSection: { marginBottom: 16 },
+  apptHeading: { color: '#94a3b8', fontSize: 13, marginBottom: 8 },
+  apptRow: {
+    backgroundColor: '#1e293b',
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 6,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  apptWith: { color: 'white', fontSize: 13, fontWeight: '600', flex: 1 },
+  apptWhen: { color: '#94a3b8', fontSize: 11, flex: 1 },
+  apptStatus: { fontSize: 11, fontWeight: '600' },
+  apptStatusActive: { color: '#22c55e' },
+  apptStatusInactive: { color: '#94a3b8' },
 });

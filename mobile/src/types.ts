@@ -12,6 +12,18 @@ export interface IceServer {
   credential?: string;
 }
 
+export interface Appointment {
+  id: string;
+  doctor_id: string;
+  doctor_name: string;
+  patient_id: string;
+  patient_name: string;
+  scheduled_time: string; // ISO 8601
+  status: 'scheduled' | 'completed' | 'cancelled';
+  notes: string | null;
+  created_at: string;
+}
+
 export type CallMedia = 'audio' | 'video';
 
 export type SignalingMessage =

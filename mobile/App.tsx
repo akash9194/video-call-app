@@ -10,6 +10,7 @@ import { CallProvider } from './src/context/CallContext';
 import LoginScreen from './src/screens/LoginScreen';
 import SignupScreen from './src/screens/SignupScreen';
 import HomeScreen from './src/screens/HomeScreen';
+import ScheduleScreen from './src/screens/ScheduleScreen';
 import CallScreen from './src/screens/CallScreen';
 import IncomingCallScreen from './src/screens/IncomingCallScreen';
 
@@ -39,6 +40,7 @@ function RootNavigator() {
       {user ? (
         <>
           <Stack.Screen name="Home" component={HomeScreen} />
+          <Stack.Screen name="Schedule" component={ScheduleScreen} />
           <Stack.Screen name="IncomingCall" component={IncomingCallScreen} />
           <Stack.Screen name="Call" component={CallScreen} options={{ gestureEnabled: false }} />
         </>

@@ -7,6 +7,7 @@ export type RootStackParamList = {
   Login: undefined;
   Signup: undefined;
   Home: undefined;
+  Schedule: { patientId: string; patientName: string };
   Call: { callId: string; remoteUserId: string; remoteUserName: string; isCaller: boolean };
   IncomingCall: { callId: string; fromUserId: string; fromUserName: string; media: CallMedia };
 };

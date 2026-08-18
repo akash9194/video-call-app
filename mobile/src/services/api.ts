@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { API_BASE_URL } from '../config';
-import { User, IceServer } from '../types';
+import { User, IceServer, Appointment } from '../types';
 
 const TOKEN_KEY = 'auth_token';
 
@@ -63,5 +63,20 @@ export const api = {
 
   async callHistory() {
     return request('/calls/history');
+  },
+
+  // Doctor-only initiation requires an active appointment with the
+  // patient before call:invite is allowed -- see backend/app/signaling/
+  // ws_manager.py. These are the mobile equivalents of the web test
+  // client's Schedule flow.
+  async createAppointment(patientId: string, scheduledTimeIso: string, notes?: string) {
+    return request('/appointments', {
+      method: 'POST',
+      body: JSON.stringify({ patient_id: patientId, scheduled_time: scheduledTimeIso, notes: notes || null }),
+    }) as Promise<Appointment>;
+  },
+
+  async listAppointments() {
+    return request('/appointments') as Promise<Appointment[]>;
   },
 };
