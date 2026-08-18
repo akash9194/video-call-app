@@ -73,6 +73,13 @@
   </div>
   <h2 id="auth-title" style="margin-top:0">Log in</h2>
   <input id="signup-name" placeholder="Name" style="display:none" />
+  <select id="signup-role" style="display:none; width:100%; padding:10px; margin-bottom:10px; border-radius:8px; border:none; background:#0f172a; color:white; font-size:14px">
+    <option value="patient">Patient</option>
+    <option value="doctor">Doctor</option>
+  </select>
+  <div id="signup-role-hint" style="display:none; color:#64748b; font-size:11px; margin-top:-6px; margin-bottom:10px">
+    Patients can't start calls -- only a doctor can call a patient.
+  </div>
   <input id="email" placeholder="Email" />
   <input id="password" type="password" placeholder="Password" />
   <div id="auth-error" style="color:#f87171; font-size:13px; display:none; margin-bottom:8px"></div>
@@ -135,6 +142,8 @@ function toggleAuthMode() {
   authMode = authMode === 'login' ? 'signup' : 'login';
   document.getElementById('auth-title').textContent = authMode === 'login' ? 'Log in' : 'Sign up';
   document.getElementById('signup-name').style.display = authMode === 'signup' ? 'block' : 'none';
+  document.getElementById('signup-role').style.display = authMode === 'signup' ? 'block' : 'none';
+  document.getElementById('signup-role-hint').style.display = authMode === 'signup' ? 'block' : 'none';
   document.getElementById('auth-submit').textContent = authMode === 'login' ? 'Log in' : 'Sign up';
   document.getElementById('auth-toggle').textContent = authMode === 'login' ? "Don't have an account? Sign up" : 'Already have an account? Log in';
   document.getElementById('auth-error').style.display = 'none';
@@ -150,9 +159,10 @@ async function submitAuth() {
     let resp;
     if (authMode === 'signup') {
       const name = document.getElementById('signup-name').value.trim();
+      const role = document.getElementById('signup-role').value;
       resp = await fetch(apiBase + '/auth/signup', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, email, password, role: 'freelancer' }),
+        body: JSON.stringify({ name, email, password, role }),
       });
     } else {
       resp = await fetch(apiBase + '/auth/login', {
@@ -201,18 +211,27 @@ async function loadUsers() {
     if (users.length === 0) {
       list.innerHTML = '<div style="color:#64748b; font-size:13px; text-align:center; padding:12px">No other users yet - sign up a second account in another tab.</div>';
     }
+    // Doctor-only initiation: the buttons are hidden here purely for a
+    // clean demo UX -- the real enforcement is server-side in
+    // ws_manager.py's call:invite handler, since this client-side check
+    // can't be trusted as the actual security boundary.
+    const canInitiateCalls = me.role === 'doctor';
     users.forEach(u => {
       const row = document.createElement('div');
       row.className = 'row';
       const disabledAttr = u.is_online ? '' : 'disabled style="opacity:0.4"';
       const safeName = u.name.replace(/'/g, "");
+      const canCallThisUser = canInitiateCalls && u.role === 'patient';
+      const callButtons = canCallThisUser
+        ? '<div style="display:flex; gap:6px">' +
+          '<button style="width:auto; padding:8px 12px; background:#2563eb" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'audio\')">Voice</button>' +
+          '<button style="width:auto; padding:8px 12px" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'video\')">Video</button>' +
+          '</div>'
+        : '';
       row.innerHTML =
         '<div><div style="font-weight:600; font-size:14px">' + u.name + '</div>' +
-        '<div style="font-size:12px; color:#94a3b8"><span class="status-dot" style="background:' + (u.is_online ? '#22c55e' : '#64748b') + '"></span>' + (u.is_online ? 'Online' : 'Offline') + '</div></div>' +
-        '<div style="display:flex; gap:6px">' +
-        '<button style="width:auto; padding:8px 12px; background:#2563eb" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'audio\')">Voice</button>' +
-        '<button style="width:auto; padding:8px 12px" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'video\')">Video</button>' +
-        '</div>';
+        '<div style="font-size:12px; color:#94a3b8"><span class="status-dot" style="background:' + (u.is_online ? '#22c55e' : '#64748b') + '"></span>' + (u.is_online ? 'Online' : 'Offline') + ' · ' + u.role + '</div></div>' +
+        callButtons;
       list.appendChild(row);
     });
   } catch (e) { console.warn('loadUsers failed', e); }
@@ -273,6 +292,15 @@ async function handleSignal(msg) {
       // renegotiation (if any) to land.
       isRemoteVideoOn = msg.media === 'video';
       updateRemoteVideoVisibility();
+      break;
+    case 'error':
+      // Most relevant here: call:invite was rejected server-side (not a
+      // doctor, invalid callee, or no active appointment) -- no call_id
+      // was ever created, so just surface the reason and reset.
+      if (callId === null && document.getElementById('call-screen').style.display === 'block') {
+        alert('Call not started: ' + msg.message);
+        cleanupCall();
+      }
       break;
     case 'call:rejected':
     case 'call:cancelled':

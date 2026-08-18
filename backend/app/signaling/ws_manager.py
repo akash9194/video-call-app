@@ -32,7 +32,20 @@ Protocol (all messages are JSON with a "type" field):
     webrtc:offer / answer / ice-candidate  (relayed as-is)
     call:media-switch      { call_id, from: userId, media: "audio" | "video" }  (relayed as-is)
     presence:update         { user_id, is_online }
-    error                   { message }
+    error                   { message, code }
+
+Doctor-only initiation
+-----------------------
+Only a "doctor"-role user can send call:invite; a "patient"-role user
+never can. This is enforced here in the server, not just by hiding the UI
+button on the client, since a client is never trusted input. A doctor also
+needs an active ("scheduled") appointment with the specific patient they're
+calling -- see appointments_collection / app/routers/appointments.py. A
+rejected call:invite never creates a call_id and gets a targeted `error`
+back with a `code` the client can key off of:
+    not_authorized_to_call  -- sender isn't a doctor
+    invalid_callee           -- target isn't a patient (or doesn't exist)
+    no_active_appointment    -- no scheduled appointment links the two
 
 Switching between voice and video mid-call is NOT a new call -- it's a
 WebRTC renegotiation on the *existing* peer connection: the side that's
@@ -64,7 +77,7 @@ from datetime import datetime, timezone
 from fastapi import WebSocket
 from bson import ObjectId
 
-from app.database import calls_collection, users_collection
+from app.database import appointments_collection, calls_collection, users_collection
 
 
 class ConnectionManager:
@@ -146,7 +159,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-async def handle_message(sender_id: str, sender_device_id: str, sender_name: str, message: dict):
+async def handle_message(sender_id: str, sender_device_id: str, sender_name: str, sender_role: str, message: dict):
     msg_type = message.get("type")
 
     if msg_type == "call:invite":
@@ -154,6 +167,42 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
         media = message.get("media", "video")
         if media not in ("audio", "video"):
             media = "video"
+
+        # -- Doctor-only initiation -----------------------------------
+        # This is enforced here, server-side, deliberately -- a patient's
+        # client can't be trusted to just hide the "call" button, since
+        # nothing stops a modified/malicious client from sending this
+        # message directly. Reject anything that isn't a doctor calling a
+        # patient before a call_id is even created.
+        if sender_role != "doctor":
+            await manager.send_to_device(
+                sender_id, sender_device_id,
+                {"type": "error", "message": "Only a doctor can start a call.", "code": "not_authorized_to_call"},
+            )
+            return
+
+        callee = await users_collection.find_one({"_id": ObjectId(callee_id)})
+        if not callee or callee.get("role") != "patient":
+            await manager.send_to_device(
+                sender_id, sender_device_id,
+                {"type": "error", "message": "You can only call a patient.", "code": "invalid_callee"},
+            )
+            return
+
+        # -- Appointment linkage ---------------------------------------
+        # A doctor can only ring a patient they have an active (not
+        # completed/cancelled) appointment with -- prevents unrelated or
+        # accidental doctor -> patient contact.
+        appointment = await appointments_collection.find_one(
+            {"doctor_id": sender_id, "patient_id": callee_id, "status": "scheduled"}
+        )
+        if not appointment:
+            await manager.send_to_device(
+                sender_id, sender_device_id,
+                {"type": "error", "message": "No active appointment with this patient. Schedule one before calling.", "code": "no_active_appointment"},
+            )
+            return
+
         call_id = str(uuid.uuid4())
 
         # Pin the caller's device now -- everything for this call_id that's

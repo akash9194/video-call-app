@@ -7,7 +7,7 @@ interface AuthContextValue {
   user: User | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  signup: (name: string, email: string, password: string, role: 'client' | 'freelancer') => Promise<void>;
+  signup: (name: string, email: string, password: string, role: 'doctor' | 'patient') => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -39,7 +39,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     signalingClient.connect(data.access_token);
   };
 
-  const signup = async (name: string, email: string, password: string, role: 'client' | 'freelancer') => {
+  const signup = async (name: string, email: string, password: string, role: 'doctor' | 'patient') => {
     const data = await api.signup(name, email, password, role);
     setUser(data.user);
     signalingClient.connect(data.access_token);

@@ -24,6 +24,13 @@ export default function HomeScreen() {
     load();
   }, [load]);
 
+  // Doctor-only initiation: a patient never gets call buttons, regardless
+  // of who they're looking at. This mirrors the server-side check in
+  // ws_manager.py -- the UI restriction is just for a clean experience,
+  // the real enforcement lives on the backend since a client can't be
+  // trusted to police itself.
+  const canInitiateCalls = user?.role === 'doctor';
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
@@ -33,34 +40,46 @@ export default function HomeScreen() {
         </TouchableOpacity>
       </View>
 
+      {!canInitiateCalls && (
+        <Text style={styles.patientHint}>
+          Your doctor will call you when it's time for your appointment -- you can't start a call yourself.
+        </Text>
+      )}
+
       <FlatList
         data={users}
         keyExtractor={(u) => u.id}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} />}
-        renderItem={({ item }) => (
-          <View style={styles.row}>
-            <View>
-              <Text style={styles.name}>{item.name}</Text>
-              <Text style={styles.status}>{item.is_online ? 'Online' : 'Offline'} · {item.role}</Text>
+        renderItem={({ item }) => {
+          // Doctors can only call patients (mirrors the backend check).
+          const canCallThisUser = canInitiateCalls && item.role === 'patient';
+          return (
+            <View style={styles.row}>
+              <View>
+                <Text style={styles.name}>{item.name}</Text>
+                <Text style={styles.status}>{item.is_online ? 'Online' : 'Offline'} · {item.role}</Text>
+              </View>
+              {canCallThisUser && (
+                <View style={{ flexDirection: 'row', gap: 8 }}>
+                  <TouchableOpacity
+                    style={[styles.callButton, styles.voiceButton, !item.is_online && styles.callButtonDisabled]}
+                    disabled={!item.is_online}
+                    onPress={() => startCall(item.id, item.name, 'audio')}
+                  >
+                    <Text style={styles.callButtonText}>Voice</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.callButton, !item.is_online && styles.callButtonDisabled]}
+                    disabled={!item.is_online}
+                    onPress={() => startCall(item.id, item.name, 'video')}
+                  >
+                    <Text style={styles.callButtonText}>Video</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
             </View>
-            <View style={{ flexDirection: 'row', gap: 8 }}>
-              <TouchableOpacity
-                style={[styles.callButton, styles.voiceButton, !item.is_online && styles.callButtonDisabled]}
-                disabled={!item.is_online}
-                onPress={() => startCall(item.id, item.name, 'audio')}
-              >
-                <Text style={styles.callButtonText}>Voice</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.callButton, !item.is_online && styles.callButtonDisabled]}
-                disabled={!item.is_online}
-                onPress={() => startCall(item.id, item.name, 'video')}
-              >
-                <Text style={styles.callButtonText}>Video</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        )}
+          );
+        }}
         ListEmptyComponent={<Text style={styles.empty}>No other users yet.</Text>}
       />
     </View>
@@ -72,6 +91,7 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
   title: { fontSize: 22, fontWeight: '700', color: 'white' },
   logout: { color: '#93c5fd' },
+  patientHint: { color: '#94a3b8', fontSize: 13, marginBottom: 12 },
   row: {
     flexDirection: 'row',
     justifyContent: 'space-between',

@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import { Alert } from 'react-native';
 import InCallManager from 'react-native-incall-manager';
 import { MediaStream } from 'react-native-webrtc';
 
@@ -288,6 +289,19 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           // avatar) without waiting for the renegotiation round-trip (if
           // any) to land.
           setIsRemoteVideoOn(msg.media === 'video');
+          break;
+        }
+
+        case 'error': {
+          // Most relevant here: call:invite was rejected server-side (not
+          // authorized to call, invalid callee, or no active appointment)
+          // -- the client was never told a call_id, so there's nothing to
+          // clean up beyond resetting the "Calling..." state.
+          if (status === 'calling') {
+            Alert.alert('Call not started', msg.message);
+            resetCallState();
+            navigate('Home');
+          }
           break;
         }
 

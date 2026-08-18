@@ -12,6 +12,7 @@ db = client[settings.mongo_db_name]
 
 users_collection = db["users"]
 calls_collection = db["calls"]
+appointments_collection = db["appointments"]
 
 
 async def ensure_indexes():
@@ -20,3 +21,4 @@ async def ensure_indexes():
     await calls_collection.create_index("call_id", unique=True)
     await calls_collection.create_index("caller_id")
     await calls_collection.create_index("callee_id")
+    await appointments_collection.create_index([("doctor_id", 1), ("patient_id", 1), ("status", 1)])

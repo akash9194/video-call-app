@@ -43,7 +43,7 @@ async def signaling_endpoint(websocket: WebSocket, token: str = Query(...), devi
             # receiving calls) until the app reconnects. Only a real
             # disconnect should end this loop.
             try:
-                await handle_message(user_id, connection_device_id, user["name"], message)
+                await handle_message(user_id, connection_device_id, user["name"], user["role"], message)
             except Exception:
                 logger.exception("Error handling signaling message %r from user %s", message, user_id)
     except WebSocketDisconnect:

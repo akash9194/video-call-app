@@ -8,7 +8,7 @@ export default function SignupScreen({ navigation }: { navigation: NavProp }) {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [role, setRole] = useState<'client' | 'freelancer'>('freelancer');
+  const [role, setRole] = useState<'doctor' | 'patient'>('patient');
   const [submitting, setSubmitting] = useState(false);
 
   const onSubmit = async () => {
@@ -41,17 +41,23 @@ export default function SignupScreen({ navigation }: { navigation: NavProp }) {
         value={password}
         onChangeText={setPassword}
       />
+      <Text style={styles.roleLabel}>I am a...</Text>
       <View style={styles.roleRow}>
-        {(['client', 'freelancer'] as const).map((r) => (
+        {(['patient', 'doctor'] as const).map((r) => (
           <TouchableOpacity
             key={r}
             style={[styles.roleButton, role === r && styles.roleButtonActive]}
             onPress={() => setRole(r)}
           >
-            <Text style={{ color: 'white' }}>{r}</Text>
+            <Text style={{ color: 'white' }}>{r === 'doctor' ? 'Doctor' : 'Patient'}</Text>
           </TouchableOpacity>
         ))}
       </View>
+      {role === 'patient' && (
+        <Text style={styles.hint}>
+          As a patient, your doctor will call you -- you won't be able to start calls yourself.
+        </Text>
+      )}
       <TouchableOpacity style={styles.button} onPress={onSubmit} disabled={submitting}>
         <Text style={styles.buttonText}>{submitting ? 'Creating…' : 'Sign up'}</Text>
       </TouchableOpacity>
@@ -72,9 +78,11 @@ const styles = StyleSheet.create({
     padding: 14,
     marginBottom: 12,
   },
-  roleRow: { flexDirection: 'row', gap: 12, marginBottom: 12 },
+  roleLabel: { color: '#94a3b8', marginBottom: 8 },
+  roleRow: { flexDirection: 'row', gap: 12, marginBottom: 8 },
   roleButton: { flex: 1, padding: 12, borderRadius: 8, backgroundColor: '#1e293b', alignItems: 'center' },
   roleButtonActive: { backgroundColor: '#2563eb' },
+  hint: { color: '#94a3b8', fontSize: 12, marginBottom: 12 },
   button: { backgroundColor: '#2563eb', borderRadius: 8, padding: 14, alignItems: 'center', marginTop: 8 },
   buttonText: { color: 'white', fontWeight: '600', fontSize: 16 },
   link: { color: '#93c5fd', textAlign: 'center', marginTop: 16 },

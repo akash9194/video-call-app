@@ -5,7 +5,9 @@ class UserSignup(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     email: EmailStr
     password: str = Field(min_length=6)
-    role: str = Field(default="client", pattern="^(client|freelancer)$")
+    # "doctor" can initiate calls; "patient" can never initiate one (see
+    # ws_manager.handle_message's call:invite handler for enforcement).
+    role: str = Field(default="patient", pattern="^(doctor|patient)$")
 
 
 class UserLogin(BaseModel):

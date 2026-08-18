@@ -22,7 +22,7 @@ async function request(path: string, options: RequestInit = {}) {
 }
 
 export const api = {
-  async signup(name: string, email: string, password: string, role: 'client' | 'freelancer') {
+  async signup(name: string, email: string, password: string, role: 'doctor' | 'patient') {
     const data = await request('/auth/signup', {
       method: 'POST',
       body: JSON.stringify({ name, email, password, role }),

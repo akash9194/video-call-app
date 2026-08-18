@@ -2,7 +2,7 @@ export interface User {
   id: string;
   name: string;
   email: string;
-  role: 'client' | 'freelancer';
+  role: 'doctor' | 'patient';
   is_online: boolean;
 }
 
@@ -27,7 +27,7 @@ export type SignalingMessage =
   | { type: 'webrtc:ice-candidate'; call_id: string; from: string; candidate: any }
   | { type: 'call:media-switch'; call_id: string; from: string; media: CallMedia }
   | { type: 'presence:update'; user_id: string; is_online: boolean }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string; code?: string };
 
 export type CallStatus =
   | 'idle'
