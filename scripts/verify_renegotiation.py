@@ -127,7 +127,7 @@ async def main():
     call_id = incoming["call_id"]
     pa.call_id = pb.call_id = call_id
 
-    await pb.send({"type": "call:accept", "call_id": call_id, "to": pb.other_id})
+    await pb.send({"type": "call:accept", "call_id": call_id, "to": pb.other_id, "consent": True})
     accepted = await pa.wait_for("call:accepted")
     check("caller received call:accepted", accepted is not None)
 

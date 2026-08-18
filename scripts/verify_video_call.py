@@ -185,7 +185,7 @@ async def run_call_simulation():
     peer_b.call_id = call_id
 
     print("\n4. B accepts the call (call:accept)")
-    await peer_b.send({"type": "call:accept", "call_id": call_id, "to": peer_b.other_id})
+    await peer_b.send({"type": "call:accept", "call_id": call_id, "to": peer_b.other_id, "consent": True})
     accepted = await peer_a.wait_for("call:accepted")
     check("A received call:accepted", accepted is not None)
 

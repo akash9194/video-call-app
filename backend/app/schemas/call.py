@@ -15,6 +15,8 @@ class CallOut(BaseModel):
     started_at: datetime | None = None
     ended_at: datetime | None = None
     duration_seconds: int | None = None
+    consent_given: bool = False
+    consent_at: datetime | None = None
 
 
 class IceServersResponse(BaseModel):

@@ -69,7 +69,22 @@ A few more scripts cover the other pieces -- run these against an already-runnin
 python scripts\verify_renegotiation.py    # switching voice <-> video mid-call
 python scripts\verify_multi_device.py     # same account signed in on 3 devices at once
 python scripts\verify_doctor_patient.py   # doctor-only initiation + appointment enforcement, including rejection cases
+python scripts\verify_consent.py          # patient consent is required before call:accept is honored
 python scripts\verify_turn.py             # TURN relay -- skips cleanly until you've set TURN_URLS/TURN_SHARED_SECRET (see docs\TURN_SERVER_SETUP.md)
+```
+
+One more covers the ringing-timeout and reconnection/disconnect-grace behavior, which need short timeouts to test quickly rather than the real 45s/30s defaults:
+
+```
+set RINGING_TIMEOUT_SECONDS=3
+set DISCONNECT_GRACE_SECONDS=3
+python scripts\_mock_server.py
+```
+then, in another terminal, with the same two variables set:
+```
+set RINGING_TIMEOUT_SECONDS=3
+set DISCONNECT_GRACE_SECONDS=3
+python scripts\verify_call_resilience.py
 ```
 
 ## Running against real MongoDB (data persists between restarts)

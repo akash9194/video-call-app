@@ -28,7 +28,7 @@ see both sides of the call at once.
 
 1. **Show both tabs side by side.** Point out each shows the other as "Online" — that's real-time presence over a WebSocket, not a page refresh.
 2. **In the doctor's tab, click "Video"** next to the patient. Narrate: this sends a `call:invite` over the signaling connection — and would be rejected server-side if this were the patient's tab instead, or if no appointment existed.
-3. **Switch to the patient's tab** — the incoming call screen appears with Accept/Decline. Click **Accept**.
+3. **Switch to the patient's tab** — the incoming call screen appears with Accept/Decline. Narrate: before Accept is even clickable, the patient has to check the consent box ("I consent to this telehealth video/voice consultation...") — this is also enforced server-side (the accept is rejected with `consent_required` if that flag isn't sent), not just a disabled button. Check it, then click **Accept**.
 4. **Both tabs now show live video** using your webcam — this is a real WebRTC peer-to-peer connection; camera/mic frames are going directly between the two tabs, not through the server.
 5. **Click "Switch to voice"** in either tab. Narrate: the video track just gets disabled locally and the other side is notified — no renegotiation needed, which is why it's instant.
 6. **Click "Switch to video"** again to turn it back on.

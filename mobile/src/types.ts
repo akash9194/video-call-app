@@ -30,10 +30,13 @@ export type SignalingMessage =
   | { type: 'call:incoming'; call_id: string; from: string; from_name: string; media: CallMedia }
   | { type: 'call:accepted'; call_id: string; from: string }
   | { type: 'call:rejected'; call_id: string; from: string }
-  | { type: 'call:cancelled'; call_id: string; from: string }
+  | { type: 'call:cancelled'; call_id: string; from: string; reason?: string }
   | { type: 'call:answered_elsewhere'; call_id: string; from: string }
-  | { type: 'call:ended'; call_id: string; from: string }
+  | { type: 'call:ended'; call_id: string; from: string; reason?: string }
   | { type: 'call:user-offline'; call_id: string }
+  | { type: 'call:timeout'; call_id: string }
+  | { type: 'call:peer-disconnected'; call_id: string }
+  | { type: 'call:peer-reconnected'; call_id: string }
   | { type: 'webrtc:offer'; call_id: string; from: string; sdp: any }
   | { type: 'webrtc:answer'; call_id: string; from: string; sdp: any }
   | { type: 'webrtc:ice-candidate'; call_id: string; from: string; candidate: any }
@@ -47,4 +50,5 @@ export type CallStatus =
   | 'incoming' // someone is calling us
   | 'connecting' // accepted, doing SDP/ICE exchange
   | 'active'
+  | 'reconnecting' // active call, peer's connection just dropped -- grace period before it's treated as over
   | 'ended';

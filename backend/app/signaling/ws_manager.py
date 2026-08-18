@@ -12,7 +12,7 @@ Protocol (all messages are JSON with a "type" field):
 
   Client -> Server
     call:invite         { to: userId, media: "audio" | "video" }
-    call:accept         { call_id, to: userId }
+    call:accept         { call_id, to: userId, consent: true }
     call:reject         { call_id, to: userId }
     call:cancel         { call_id, to: userId }
     call:end            { call_id, to: userId }
@@ -25,10 +25,13 @@ Protocol (all messages are JSON with a "type" field):
     call:incoming          { call_id, from: userId, from_name, media: "audio" | "video" }
     call:accepted           { call_id, from: userId }
     call:rejected           { call_id, from: userId }
-    call:cancelled          { call_id, from: userId }
+    call:cancelled          { call_id, from: userId, reason?: "timeout" }
     call:answered_elsewhere { call_id, from: userId }  (sent to this user's OTHER devices)
-    call:ended               { call_id, from: userId }
+    call:ended               { call_id, from: userId, reason?: "peer_disconnected" }
+    call:timeout            { call_id }   (caller only: nobody answered in time)
     call:user-offline      { call_id }   (callee not connected on any device)
+    call:peer-disconnected  { call_id }   (the other party's connection just dropped -- show "Reconnecting...", don't end the call yet)
+    call:peer-reconnected   { call_id }   (they're back -- clear the "Reconnecting..." state)
     webrtc:offer / answer / ice-candidate  (relayed as-is)
     call:media-switch      { call_id, from: userId, media: "audio" | "video" }  (relayed as-is)
     presence:update         { user_id, is_online }
@@ -46,6 +49,15 @@ back with a `code` the client can key off of:
     not_authorized_to_call  -- sender isn't a doctor
     invalid_callee           -- target isn't a patient (or doesn't exist)
     no_active_appointment    -- no scheduled appointment links the two
+
+Patient consent
+-----------------
+The callee (always the patient) must send `consent: true` on call:accept
+for it to be honored -- this is the server-side gate behind the client's
+consent step before a telehealth session connects. A missing/false consent
+gets a targeted error back with code `consent_required` and the call stays
+ringing so the client can show the consent step and retry. On a successful
+accept, `consent_given`/`consent_at` are stamped onto the call record.
 
 Switching between voice and video mid-call is NOT a new call -- it's a
 WebRTC renegotiation on the *existing* peer connection: the side that's
@@ -69,8 +81,33 @@ device, and tells the callee's OTHER devices call:answered_elsewhere so
 they can dismiss their incoming-call screen. From that point on, every
 message for that call_id (webrtc:*, call:media-switch, call:end, ...) is
 routed only to the two pinned devices, never fanned out.
+
+Stale/replayed messages
+-------------------------
+call:accept and every webrtc:*/call:media-switch message are only honored
+while `call_id` is still an open entry in `call_participants` -- one that's
+already ended, timed out, or been cancelled is ignored rather than
+resurrecting call state on a client or silently corrupting a new call. This
+guards against a message arriving late (a slow network) after the call it
+refers to is already over.
+
+Ringing timeout & disconnect grace period
+-------------------------------------------
+A call left ringing for RINGING_TIMEOUT_SECONDS with nobody accepting is
+auto-expired: the caller gets call:timeout, the callee's devices get
+call:cancelled, and the call is marked "missed". Once a call is active, if
+one side's WebSocket connection drops (wifi hiccup, app backgrounded), the
+call is NOT ended immediately -- the other side gets call:peer-disconnected
+and the call stays pinned for DISCONNECT_GRACE_SECONDS so a reconnecting
+client (see signaling.ts's auto-reconnect, which reuses the same stable
+device_id) can resume it; call:peer-reconnected fires if they make it back
+in time, otherwise the call is cleanly ended with reason "peer_disconnected"
+instead of hanging forever on both sides.
 """
 
+import asyncio
+import logging
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -79,6 +116,13 @@ from bson import ObjectId
 
 from app.database import appointments_collection, calls_collection, users_collection
 
+logger = logging.getLogger(__name__)
+
+# Overridable via env for tests -- a verification script shouldn't have to
+# sleep 45+30 real seconds to exercise the timeout/grace-period paths.
+RINGING_TIMEOUT_SECONDS = int(os.environ.get("RINGING_TIMEOUT_SECONDS", "45"))
+DISCONNECT_GRACE_SECONDS = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "30"))
+
 
 class ConnectionManager:
     def __init__(self):
@@ -86,6 +130,10 @@ class ConnectionManager:
         self.active_connections: dict[str, dict[str, WebSocket]] = {}
         # call_id -> { "caller": (user_id, device_id), "callee": (user_id, device_id) | None }
         self.call_participants: dict[str, dict[str, tuple[str, str] | None]] = {}
+        # call_id -> background task, so it can be cancelled once the call
+        # resolves by some other means (accepted/rejected/cancelled/ended).
+        self.ringing_timers: dict[str, asyncio.Task] = {}
+        self.disconnect_timers: dict[str, asyncio.Task] = {}
 
     async def connect(self, user_id: str, device_id: str, websocket: WebSocket):
         await websocket.accept()
@@ -94,6 +142,18 @@ class ConnectionManager:
         if was_offline:
             await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": True}})
             await self.broadcast_presence(user_id, True)
+
+        # If this exact device was mid-call and had dropped, it just made it
+        # back inside the grace period -- tell the other side to clear its
+        # "Reconnecting..." state and cancel the pending auto-end timer.
+        for call_id, participants in list(self.call_participants.items()):
+            if call_id not in self.disconnect_timers:
+                continue
+            mine, other = self._match_participant(participants, user_id, device_id)
+            if not mine:
+                continue
+            self._cancel_disconnect_timer(call_id)
+            await self.send_to_device(other[0], other[1], {"type": "call:peer-reconnected", "call_id": call_id})
 
     async def disconnect(self, user_id: str, device_id: str):
         devices = self.active_connections.get(user_id)
@@ -104,6 +164,90 @@ class ConnectionManager:
         if not self.active_connections.get(user_id):
             await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_online": False}})
             await self.broadcast_presence(user_id, False)
+
+        # If this device was a pinned participant of a still-active call,
+        # don't just let the call go silent for the other side: tell them
+        # right away, and give this device a grace period to reconnect
+        # (client auto-reconnects with the same stable device_id) before
+        # treating the call as actually over.
+        for call_id, participants in list(self.call_participants.items()):
+            if participants.get("callee") is None:
+                continue  # not yet an active call -- the ringing timeout handles this case
+            mine, other = self._match_participant(participants, user_id, device_id)
+            if not mine:
+                continue
+            await self.send_to_device(other[0], other[1], {"type": "call:peer-disconnected", "call_id": call_id})
+            self._cancel_disconnect_timer(call_id)
+            self.disconnect_timers[call_id] = asyncio.create_task(
+                self._expire_disconnected_call(call_id, user_id, device_id, other[0], other[1])
+            )
+
+    @staticmethod
+    def _match_participant(participants: dict, user_id: str, device_id: str):
+        """Returns (this_side, other_side) tuples if (user_id, device_id) is
+        one of the two pinned participants of this call, else (None, None)."""
+        caller = participants.get("caller")
+        callee = participants.get("callee")
+        target = (user_id, device_id)
+        if caller == target:
+            return caller, callee
+        if callee == target:
+            return callee, caller
+        return None, None
+
+    async def _expire_disconnected_call(self, call_id, gone_user_id, gone_device_id, other_user_id, other_device_id):
+        try:
+            await asyncio.sleep(DISCONNECT_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        still_gone = self.active_connections.get(gone_user_id, {}).get(gone_device_id) is None
+        if not still_gone:
+            return  # reconnected in time -- connect() already notified the peer
+        call = await calls_collection.find_one({"call_id": call_id})
+        update = {"status": "ended", "ended_at": datetime.now(timezone.utc)}
+        if call and call.get("started_at"):
+            update["duration_seconds"] = int((update["ended_at"] - call["started_at"]).total_seconds())
+        await calls_collection.update_one({"call_id": call_id}, {"$set": update})
+        await self.send_to_device(
+            other_user_id, other_device_id,
+            {"type": "call:ended", "call_id": call_id, "from": gone_user_id, "reason": "peer_disconnected"},
+        )
+        self.call_participants.pop(call_id, None)
+        self.disconnect_timers.pop(call_id, None)
+
+    async def _expire_ringing_call(self, call_id, caller_id, caller_device_id, callee_id):
+        try:
+            await asyncio.sleep(RINGING_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            return
+        participants = self.call_participants.get(call_id)
+        if not participants or participants.get("callee") is not None:
+            return  # already accepted/resolved by some other path
+        await calls_collection.update_one(
+            {"call_id": call_id},
+            {"$set": {"status": "missed", "ended_at": datetime.now(timezone.utc)}},
+        )
+        await self.send_to_device(caller_id, caller_device_id, {"type": "call:timeout", "call_id": call_id})
+        await self.send_to_all_devices(
+            callee_id, {"type": "call:cancelled", "call_id": call_id, "from": caller_id, "reason": "timeout"}
+        )
+        self.call_participants.pop(call_id, None)
+        self.ringing_timers.pop(call_id, None)
+
+    def _cancel_ringing_timer(self, call_id: str):
+        task = self.ringing_timers.pop(call_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _cancel_disconnect_timer(self, call_id: str):
+        task = self.disconnect_timers.pop(call_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def clear_call(self, call_id: str):
+        self._cancel_ringing_timer(call_id)
+        self._cancel_disconnect_timer(call_id)
+        self.call_participants.pop(call_id, None)
 
     async def broadcast_presence(self, user_id: str, is_online: bool):
         payload = {"type": "presence:update", "user_id": user_id, "is_online": is_online}
@@ -149,7 +293,13 @@ class ConnectionManager:
         if participants:
             for entry in (participants.get("caller"), participants.get("callee")):
                 if entry and entry[0] == target_user_id:
-                    return await self.send_to_device(target_user_id, entry[1], message)
+                    if await self.send_to_device(target_user_id, entry[1], message):
+                        return True
+                    # The pinned device isn't reachable right now -- e.g. it
+                    # reconnected under a fresh device_id somehow. Fall back
+                    # to whatever devices of theirs ARE connected instead of
+                    # silently dropping a message for an active call.
+                    return await self.send_to_all_devices(target_user_id, message)
         return await self.send_to_all_devices(target_user_id, message)
 
     def is_online(self, user_id: str) -> bool:
@@ -220,6 +370,8 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
                 "started_at": None,
                 "ended_at": None,
                 "duration_seconds": None,
+                "consent_given": False,
+                "consent_at": None,
                 "created_at": datetime.now(timezone.utc),
             }
         )
@@ -239,25 +391,52 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             await calls_collection.update_one({"call_id": call_id}, {"$set": {"status": "missed"}})
             await manager.send_to_device(sender_id, sender_device_id, {"type": "call:user-offline", "call_id": call_id})
             manager.call_participants.pop(call_id, None)
+        else:
+            # Nobody answered within RINGING_TIMEOUT_SECONDS -- auto-expire
+            # rather than leaving a "ringing" call (and a ringing UI on the
+            # callee's devices) stuck forever.
+            manager.ringing_timers[call_id] = asyncio.create_task(
+                manager._expire_ringing_call(call_id, sender_id, sender_device_id, callee_id)
+            )
         return
 
     if msg_type == "call:accept":
         call_id = message["call_id"]
         participants = manager.call_participants.get(call_id)
-        # First device to accept wins. Pin this device as the callee for
-        # the rest of the call, and tell any other devices of this same
-        # user that they were beaten to it so they can dismiss the
-        # incoming-call screen.
-        if participants and participants.get("callee") is None:
+        if not participants:
+            # Stale/replayed accept for a call that's already ended, timed
+            # out, or was cancelled -- ignore rather than resurrecting it.
+            return
+
+        if participants.get("callee") is None:
+            # -- Patient consent gate ---------------------------------
+            # The callee here is always the patient (only doctors can
+            # invite). Require explicit consent before pinning this device
+            # as the callee or marking the call active -- enforced here,
+            # not just by a client-side modal, same reasoning as
+            # doctor-only initiation above: a client can't be trusted.
+            if not message.get("consent"):
+                await manager.send_to_device(
+                    sender_id, sender_device_id,
+                    {"type": "error", "message": "Patient consent is required before joining the call.", "code": "consent_required"},
+                )
+                return
+            # First device to accept wins. Pin this device as the callee
+            # for the rest of the call, and tell any other devices of this
+            # same user that they were beaten to it so they can dismiss
+            # the incoming-call screen.
             participants["callee"] = (sender_id, sender_device_id)
             await manager.send_to_all_devices(
                 sender_id,
                 {"type": "call:answered_elsewhere", "call_id": call_id, "from": sender_id},
                 exclude_device=sender_device_id,
             )
+
+        manager._cancel_ringing_timer(call_id)
+        now = datetime.now(timezone.utc)
         await calls_collection.update_one(
             {"call_id": call_id},
-            {"$set": {"status": "active", "started_at": datetime.now(timezone.utc)}},
+            {"$set": {"status": "active", "started_at": now, "consent_given": True, "consent_at": now}},
         )
         await manager.route(call_id, message["to"], {"type": "call:accepted", "call_id": call_id, "from": sender_id})
         return
@@ -266,7 +445,7 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
         call_id = message["call_id"]
         await calls_collection.update_one({"call_id": call_id}, {"$set": {"status": "rejected"}})
         await manager.route(call_id, message["to"], {"type": "call:rejected", "call_id": call_id, "from": sender_id})
-        manager.call_participants.pop(call_id, None)
+        manager.clear_call(call_id)
         return
 
     if msg_type == "call:cancel":
@@ -276,7 +455,7 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
         # still pre-accept this correctly fans out to every device that was
         # ringing so they all stop.
         await manager.route(call_id, message["to"], {"type": "call:cancelled", "call_id": call_id, "from": sender_id})
-        manager.call_participants.pop(call_id, None)
+        manager.clear_call(call_id)
         return
 
     if msg_type == "call:end":
@@ -288,7 +467,7 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             update["duration_seconds"] = int(duration)
         await calls_collection.update_one({"call_id": call_id}, {"$set": update})
         await manager.route(call_id, message["to"], {"type": "call:ended", "call_id": call_id, "from": sender_id})
-        manager.call_participants.pop(call_id, None)
+        manager.clear_call(call_id)
         return
 
     if msg_type in ("webrtc:offer", "webrtc:answer", "webrtc:ice-candidate", "call:media-switch"):
@@ -296,6 +475,10 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
         # is just an advance notice for the UI; the real change happens via
         # the webrtc:offer/answer renegotiation the client sends alongside it.
         call_id = message.get("call_id")
+        if call_id not in manager.call_participants:
+            # Stale/replayed message for a call that's already over --
+            # ignore instead of acting on invalid call state.
+            return
         await manager.route(call_id, message["to"], {**message, "from": sender_id})
         return
 

@@ -21,7 +21,7 @@ interface CallContextValue {
   isVideoOn: boolean; // do we currently have a live local video track in this call?
   isRemoteVideoOn: boolean; // is the OTHER side currently sending video?
   startCall: (calleeId: string, calleeName: string, media: CallMedia) => Promise<void>;
-  acceptCall: () => Promise<void>;
+  acceptCall: (consent: boolean) => Promise<void>;
   rejectCall: () => void;
   endCall: () => void;
   toggleMute: () => void;
@@ -53,7 +53,70 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   // acceptCall for the callee) to decide whether to request a camera.
   const initialMediaRef = useRef<CallMedia>('video');
 
+  // Kept in refs (not state) since they're read/written from a setInterval
+  // callback and a signalingClient.onReconnect callback, both of which
+  // close over stale state otherwise.
+  const statsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const poorVideoStreakRef = useRef(0);
+  const lastVideoStatsRef = useRef<{ packetsLost: number; packetsReceived: number } | null>(null);
+  const callIdRef = useRef<string | null>(null);
+  const remoteUserIdRef = useRef<string | null>(null);
+  const isVideoOnRef = useRef(false);
+  useEffect(() => { callIdRef.current = callId; }, [callId]);
+  useEffect(() => { remoteUserIdRef.current = remoteUserId; }, [remoteUserId]);
+  useEffect(() => { isVideoOnRef.current = isVideoOn; }, [isVideoOn]);
+
+  const stopStatsMonitor = () => {
+    if (statsTimerRef.current) clearInterval(statsTimerRef.current);
+    statsTimerRef.current = null;
+    poorVideoStreakRef.current = 0;
+    lastVideoStatsRef.current = null;
+  };
+
+  // Polls WebRTC stats every 5s while a call has live video, and if the
+  // receiving side sees sustained heavy packet loss on the video track (3
+  // consecutive bad polls, ~15s) auto-switches to audio-only rather than
+  // leaving both sides stuck with a frozen/stuttering picture -- a clean
+  // fallback beats an unpredictable one.
+  const startStatsMonitor = () => {
+    stopStatsMonitor();
+    statsTimerRef.current = setInterval(async () => {
+      const pc = pcRef.current;
+      if (!pc || !isVideoOnRef.current) {
+        poorVideoStreakRef.current = 0;
+        lastVideoStatsRef.current = null;
+        return;
+      }
+      try {
+        const stats = await pc.getStats();
+        let report: any = null;
+        stats.forEach((r: any) => {
+          if (r.type === 'inbound-rtp' && r.kind === 'video') report = r;
+        });
+        if (!report) return;
+        const now = { packetsLost: report.packetsLost || 0, packetsReceived: report.packetsReceived || 0 };
+        const last = lastVideoStatsRef.current;
+        if (last) {
+          const dLost = Math.max(0, now.packetsLost - last.packetsLost);
+          const dRecv = Math.max(0, now.packetsReceived - last.packetsReceived);
+          const total = dLost + dRecv;
+          const lossRatio = total > 0 ? dLost / total : 0;
+          poorVideoStreakRef.current = lossRatio > 0.08 ? poorVideoStreakRef.current + 1 : 0;
+          if (poorVideoStreakRef.current >= 3) {
+            poorVideoStreakRef.current = 0;
+            console.warn('[call] sustained poor video conditions -- auto-falling back to audio-only');
+            switchToVoice();
+          }
+        }
+        lastVideoStatsRef.current = now;
+      } catch (e) {
+        console.warn('[call] getStats failed', e);
+      }
+    }, 5000);
+  };
+
   const resetCallState = () => {
+    stopStatsMonitor();
     pcRef.current?.close();
     pcRef.current = null;
     localStream?.getTracks().forEach((t) => t.stop());
@@ -101,6 +164,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
       }
     };
 
+    startStatsMonitor();
     return pc;
   };
 
@@ -113,12 +177,18 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     // call_id + offer creation happens once the callee accepts (see call:accepted below)
   };
 
-  const acceptCall = async () => {
+  const acceptCall = async (consent: boolean) => {
     if (!callId || !remoteUserId) return;
+    // Belt-and-suspenders: IncomingCallScreen disables Accept until this is
+    // checked, but the real gate is server-side (ws_manager.py rejects an
+    // accept with no consent:true, code consent_required) since a
+    // client-side check alone could be bypassed the same way doctor-only
+    // initiation could.
+    if (!consent) return;
     setStatus('connecting');
     InCallManager.start({ media: 'video' });
     await setupPeerConnection(remoteUserId, callId, initialMediaRef.current);
-    signalingClient.send({ type: 'call:accept', call_id: callId, to: remoteUserId });
+    signalingClient.send({ type: 'call:accept', call_id: callId, to: remoteUserId, consent: true });
     // Offer will arrive from the caller next; we answer it in the message handler.
   };
 
@@ -293,6 +363,17 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         }
 
         case 'error': {
+          if (msg.code === 'consent_required') {
+            // Shouldn't normally happen -- IncomingCallScreen disables
+            // Accept until consent is checked -- but the server is the
+            // real gate, so handle a rejection here too rather than
+            // leaving the UI stuck on "Connecting...".
+            Alert.alert('Could not join', msg.message);
+            InCallManager.stopRingtone();
+            resetCallState();
+            navigate('Home');
+            break;
+          }
           // Most relevant here: call:invite was rejected server-side (not
           // authorized to call, invalid callee, or no active appointment)
           // -- the client was never told a call_id, so there's nothing to
@@ -305,15 +386,45 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           break;
         }
 
+        case 'call:timeout': {
+          // We were the caller and nobody answered in time.
+          Alert.alert('No answer', 'The call timed out.');
+          resetCallState();
+          navigate('Home');
+          break;
+        }
+
+        case 'call:peer-disconnected': {
+          // The other side's connection just dropped (wifi hiccup,
+          // backgrounded app, ...) -- the call isn't over yet, the server
+          // gives them a grace period to reconnect. Show that instead of
+          // looking frozen or dead.
+          if (msg.call_id === callId) setStatus('reconnecting');
+          break;
+        }
+
+        case 'call:peer-reconnected': {
+          if (msg.call_id === callId) setStatus('active');
+          break;
+        }
+
         case 'call:rejected':
         case 'call:cancelled':
         case 'call:ended':
         case 'call:user-offline':
         case 'call:answered_elsewhere': {
-          // call:answered_elsewhere means this same account accepted the
-          // call on a different device (phone/tablet/web) -- this device
-          // was one of several that rang, and lost. Just dismiss quietly,
-          // same as any other "this call isn't happening here" case.
+          // Ignore a message for a call_id that isn't the one we're
+          // currently in -- e.g. a late/stale message for a call that
+          // already ended and was replaced by a new one. Only applies
+          // once we actually know our own call_id (callId is still null
+          // for a caller who hasn't been accepted yet -- there's nothing
+          // to compare against at that point, so let those through same
+          // as before). answered_elsewhere means this same account
+          // accepted the call on a different device (phone/tablet/web) --
+          // this device was one of several that rang, and lost. Just
+          // dismiss quietly, same as any other "this call isn't happening
+          // here" case.
+          if (callId !== null && msg.call_id && msg.call_id !== callId) break;
           InCallManager.stopRingtone();
           resetCallState();
           navigate('Home');
@@ -325,6 +436,31 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     return unsubscribe;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callId, remoteUserId, remoteUserName]);
+
+  // If the signaling socket drops and reconnects mid-call (see
+  // signaling.ts's auto-reconnect, which reuses the same stable
+  // device_id), the underlying peer connection may also have lost its ICE
+  // path even though it's technically still open. Nudge it back to life
+  // with an ICE restart now that signaling is up again to carry the
+  // renegotiation. Registered once; reads current state via refs since
+  // this effect intentionally has no deps.
+  useEffect(() => {
+    return signalingClient.onReconnect(async () => {
+      const pc = pcRef.current;
+      const currentCallId = callIdRef.current;
+      const target = remoteUserIdRef.current;
+      if (!pc || !currentCallId || !target) return;
+      if (pc.iceConnectionState !== 'disconnected' && pc.iceConnectionState !== 'failed') return;
+      try {
+        const offer = await pc.createOffer({ iceRestart: true });
+        await pc.setLocalDescription(offer);
+        signalingClient.send({ type: 'webrtc:offer', call_id: currentCallId, to: target, sdp: offer });
+      } catch (e) {
+        console.warn('[call] ICE restart failed', e);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <CallContext.Provider

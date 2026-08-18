@@ -115,7 +115,7 @@ async def main():
 
     # --- Step 2: tablet accepts first ---
     print("\nStep 2: tablet accepts -- phone and web should be told 'answered elsewhere', caller gets call:accepted")
-    await tablet.send({"type": "call:accept", "call_id": call_id, "to": caller_id})
+    await tablet.send({"type": "call:accept", "call_id": call_id, "to": caller_id, "consent": True})
 
     accepted = await caller.wait_for("call:accepted")
     check("caller received call:accepted", accepted is not None and accepted["call_id"] == call_id)

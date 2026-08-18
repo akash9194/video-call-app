@@ -117,9 +117,13 @@
   <div class="avatar" id="incoming-avatar"></div>
   <div id="incoming-name" style="font-size:18px; font-weight:600"></div>
   <div style="color:#94a3b8; font-size:13px" id="incoming-media-label">Incoming video call...</div>
+  <label style="display:flex; align-items:flex-start; gap:8px; max-width:280px; font-size:12px; color:#cbd5e1; margin-top:10px; text-align:left">
+    <input type="checkbox" id="consent-checkbox" style="margin-top:2px" onchange="document.getElementById('accept-btn').disabled = !this.checked" />
+    <span>I consent to this telehealth video/voice consultation with my doctor.</span>
+  </label>
   <div style="display:flex; gap:16px; margin-top:12px">
     <button class="danger" style="width:100px; border-radius:30px" onclick="rejectCall()">Decline</button>
-    <button class="success" style="width:100px; border-radius:30px" onclick="acceptCall()">Accept</button>
+    <button class="success" id="accept-btn" style="width:100px; border-radius:30px" onclick="acceptCall()" disabled>Accept</button>
   </div>
 </div>
 
@@ -152,6 +156,23 @@ let initialMedia = 'video'; // how the current call started -- set by placeCall 
 let isVideoOn = false;      // do we currently have a live local video track in this call?
 let isRemoteVideoOn = false;
 let usersPollTimer = null;
+let wsReconnectTimer = null;
+let statsTimer = null, poorVideoStreak = 0, lastVideoStats = null;
+
+// A stable per-browser device_id, persisted across reloads, is what lets a
+// dropped WebSocket reconnect as the SAME device server-side (see
+// ws_manager.py's disconnect/reconnect grace-period handling) instead of
+// looking like a brand-new device that the server can't route an
+// in-progress call to anymore.
+function getDeviceId() {
+  let id = localStorage.getItem('device_id');
+  if (!id) {
+    id = 'web-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    localStorage.setItem('device_id', id);
+  }
+  return id;
+}
+const deviceId = getDeviceId();
 
 function wsBase() { return apiBase.replace(/^http/, 'ws'); }
 
@@ -203,9 +224,10 @@ async function submitAuth() {
 }
 
 function logout() {
+  token = null; me = null; // clear first so the onclose handler below doesn't schedule a reconnect
   if (ws) ws.close();
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
   if (usersPollTimer) clearInterval(usersPollTimer);
-  token = null; me = null;
   document.getElementById('home-view').style.display = 'none';
   document.getElementById('auth-view').style.display = 'block';
 }
@@ -328,9 +350,29 @@ async function loadAppointments() {
 
 // ---- signaling ----
 function connectSignaling() {
-  ws = new WebSocket(wsBase() + '/ws/signaling?token=' + token);
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  ws = new WebSocket(wsBase() + '/ws/signaling?token=' + token + '&device_id=' + deviceId);
+  ws.onopen = async () => {
+    console.log('signaling connected');
+    // If we were mid-call and the underlying peer connection also dropped
+    // (not just the signaling socket -- media can keep flowing over an
+    // already-established connection even while signaling briefly drops),
+    // nudge it back to life with an ICE restart now that signaling is up
+    // again to carry the renegotiation.
+    if (pc && callId && otherId && (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed')) {
+      try {
+        const offer = await pc.createOffer({ iceRestart: true });
+        await pc.setLocalDescription(offer);
+        send({ type: 'webrtc:offer', call_id: callId, to: otherId, sdp: { type: offer.type, sdp: offer.sdp } });
+      } catch (e) { console.warn('ICE restart failed', e); }
+    }
+  };
   ws.onmessage = (ev) => handleSignal(JSON.parse(ev.data));
-  ws.onclose = () => console.log('signaling closed');
+  ws.onerror = (e) => console.warn('signaling error', e);
+  ws.onclose = () => {
+    console.log('signaling closed');
+    if (token) wsReconnectTimer = setTimeout(connectSignaling, 2000);
+  };
 }
 function send(msg) { ws.send(JSON.stringify(msg)); }
 
@@ -343,6 +385,8 @@ async function handleSignal(msg) {
       document.getElementById('incoming-avatar').textContent = otherName[0].toUpperCase();
       document.getElementById('incoming-name').textContent = otherName;
       document.getElementById('incoming-media-label').textContent = 'Incoming ' + (initialMedia === 'audio' ? 'voice' : 'video') + ' call...';
+      document.getElementById('consent-checkbox').checked = false;
+      document.getElementById('accept-btn').disabled = true;
       document.getElementById('incoming-modal').style.display = 'flex';
       break;
     case 'call:accepted':
@@ -383,6 +427,14 @@ async function handleSignal(msg) {
       updateRemoteVideoVisibility();
       break;
     case 'error':
+      if (msg.code === 'consent_required') {
+        // Shouldn't normally happen -- the Accept button is disabled until
+        // the checkbox is checked -- but the server is the real gate, so
+        // handle a rejection here too rather than leaving the UI stuck.
+        alert('Could not join: ' + msg.message);
+        cleanupCall();
+        break;
+      }
       // Most relevant here: call:invite was rejected server-side (not a
       // doctor, invalid callee, or no active appointment) -- no call_id
       // was ever created, so just surface the reason and reset.
@@ -391,14 +443,42 @@ async function handleSignal(msg) {
         cleanupCall();
       }
       break;
+    case 'call:timeout':
+      // We were the caller and nobody answered in time. callId is still
+      // null at this point (we only learn it from call:accepted, which
+      // never came) -- there's nothing to compare msg.call_id against, so
+      // just handle it directly, same as call:rejected/cancelled pre-accept.
+      alert('No answer -- call timed out.');
+      cleanupCall();
+      break;
+    case 'call:peer-disconnected':
+      // The other side's connection just dropped (wifi hiccup, backgrounded
+      // app, ...) -- the call isn't over yet, the server gives them a grace
+      // period to reconnect. Show that instead of looking frozen or dead.
+      if (msg.call_id === callId) {
+        document.getElementById('call-status').textContent = 'Reconnecting…';
+      }
+      break;
+    case 'call:peer-reconnected':
+      if (msg.call_id === callId && pc) {
+        document.getElementById('call-status').textContent = pc.connectionState;
+      }
+      break;
     case 'call:rejected':
     case 'call:cancelled':
     case 'call:ended':
     case 'call:user-offline':
     case 'call:answered_elsewhere':
-      // answered_elsewhere means this same account accepted the call in
-      // another tab/device -- this tab was one of several that rang and
-      // lost, so just dismiss quietly like any other "not happening here".
+      // Ignore a message for a call_id that isn't the one we're currently
+      // in -- e.g. a late/stale message for a call that already ended and
+      // was replaced by a new one. Only applies once we actually know our
+      // own call_id (callId is still null for a caller who hasn't been
+      // accepted yet -- there's nothing to compare against at that point,
+      // so let those through same as before). answered_elsewhere means
+      // this same account accepted the call in another tab/device -- this
+      // tab was one of several that rang and lost, so just dismiss
+      // quietly like any other "not happening here" case.
+      if (callId !== null && msg.call_id && msg.call_id !== callId) break;
       cleanupCall();
       break;
   }
@@ -417,6 +497,11 @@ async function placeCall(id, name, media) {
 }
 
 async function acceptCall() {
+  // Belt-and-suspenders: the Accept button is disabled until the checkbox
+  // is checked, but the real gate is server-side (ws_manager.py rejects an
+  // accept with no consent:true, code consent_required) since a client-side
+  // check alone could be bypassed the same way doctor-only initiation could.
+  if (!document.getElementById('consent-checkbox').checked) return;
   document.getElementById('incoming-modal').style.display = 'none';
   document.getElementById('call-peer-name').textContent = otherName;
   document.getElementById('call-status').textContent = 'Connecting...';
@@ -424,7 +509,7 @@ async function acceptCall() {
   isRemoteVideoOn = false;
   updateRemoteVideoVisibility();
   await setupPeerConnection(initialMedia === 'video');
-  send({ type: 'call:accept', call_id: callId, to: otherId });
+  send({ type: 'call:accept', call_id: callId, to: otherId, consent: true });
 }
 
 function rejectCall() {
@@ -465,6 +550,49 @@ async function setupPeerConnection(wantVideo) {
   pc.onconnectionstatechange = () => {
     document.getElementById('call-status').textContent = pc.connectionState;
   };
+  startStatsMonitor();
+}
+
+// Polls WebRTC stats every 5s while a call has live video, and if the
+// receiving side sees sustained heavy packet loss on the video track (3
+// consecutive bad polls, ~15s) auto-switches to audio-only rather than
+// leaving both sides stuck with a frozen/stuttering picture -- a clean
+// fallback beats an unpredictable one. Uses the same switchToVoice() path
+// as the manual "Switch to voice" button, so the peer is notified the same
+// way either way.
+function startStatsMonitor() {
+  stopStatsMonitor();
+  statsTimer = setInterval(monitorCallQuality, 5000);
+}
+function stopStatsMonitor() {
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = null;
+  poorVideoStreak = 0;
+  lastVideoStats = null;
+}
+async function monitorCallQuality() {
+  if (!pc || !isVideoOn) { poorVideoStreak = 0; lastVideoStats = null; return; }
+  try {
+    const stats = await pc.getStats();
+    let report = null;
+    stats.forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'video') report = r; });
+    if (!report) return;
+    const now = { packetsLost: report.packetsLost || 0, packetsReceived: report.packetsReceived || 0 };
+    if (lastVideoStats) {
+      const dLost = Math.max(0, now.packetsLost - lastVideoStats.packetsLost);
+      const dRecv = Math.max(0, now.packetsReceived - lastVideoStats.packetsReceived);
+      const total = dLost + dRecv;
+      const lossRatio = total > 0 ? dLost / total : 0;
+      poorVideoStreak = lossRatio > 0.08 ? poorVideoStreak + 1 : 0;
+      if (poorVideoStreak >= 3) {
+        poorVideoStreak = 0;
+        console.warn('Sustained poor video conditions -- auto-falling back to audio-only');
+        switchToVoice();
+        document.getElementById('call-status').textContent = 'Switched to audio-only (poor connection)';
+      }
+    }
+    lastVideoStats = now;
+  } catch (e) { console.warn('getStats failed', e); }
 }
 
 function showCallScreen() {
@@ -540,6 +668,7 @@ function switchToVoice() {
 }
 
 function cleanupCall() {
+  stopStatsMonitor();
   document.getElementById('incoming-modal').style.display = 'none';
   document.getElementById('call-screen').style.display = 'none';
   if (pc) { pc.close(); pc = null; }
