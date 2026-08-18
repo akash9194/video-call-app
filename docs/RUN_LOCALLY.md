@@ -50,17 +50,27 @@ python -m http.server 5500
 1. Open `http://localhost:5500` in one browser tab.
 2. Open it again in a second tab, or an incognito/private window (so it doesn't share login with the first).
 3. In **both** tabs, change the "Backend URL" field near the top to `http://localhost:8123`.
-4. Sign up a different account in each tab.
-5. Once each tab shows the other person as "Online," click Voice or Video to call them, and Accept in the other tab.
+4. Sign up a different account in each tab -- pick **Doctor** as the role in one, **Patient** in the other. Only a doctor account can start a call; this is enforced by the backend, not just the UI.
+5. In the doctor's tab, click **Schedule** next to the patient and pick any date/time. A call can't be placed until an appointment exists between the two -- also enforced server-side.
+6. Once each tab shows the other person as "Online," click Voice or Video **from the doctor's tab** to call the patient, and Accept in the patient's tab.
 
-## Running the automated check instead of clicking through by hand
+## Running the automated checks instead of clicking through by hand
 
 ```
 pip install -r scripts\requirements-selfcheck.txt
 python scripts\verify_video_call.py
 ```
 
-Simulates two clients placing a real WebRTC call and prints pass/fail for each step — should end with `RESULT: 15 passed, 0 failed`.
+Simulates a doctor and a patient placing a real WebRTC call (appointment included) and prints pass/fail for each step — should end with `RESULT: 16 passed, 0 failed`.
+
+A few more scripts cover the other pieces -- run these against an already-running server (`python scripts\_mock_server.py` in one terminal, these in another):
+
+```
+python scripts\verify_renegotiation.py    # switching voice <-> video mid-call
+python scripts\verify_multi_device.py     # same account signed in on 3 devices at once
+python scripts\verify_doctor_patient.py   # doctor-only initiation + appointment enforcement, including rejection cases
+python scripts\verify_turn.py             # TURN relay -- skips cleanly until you've set TURN_URLS/TURN_SHARED_SECRET (see docs\TURN_SERVER_SETUP.md)
+```
 
 ## Running against real MongoDB (data persists between restarts)
 

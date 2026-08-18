@@ -11,14 +11,16 @@ required):
     python scripts/verify_video_call.py
 
 What it does: starts the real backend/app code (MongoDB swapped for an
-in-memory mock), then simulates two app instances -- User A (caller) and
-User B (callee) -- doing everything the real mobile app does: signup,
-login, WebSocket signaling (call:invite/accept), a real WebRTC SDP
-offer/answer + ICE negotiation (using aiortc, a real WebRTC stack), and
-then confirms actual audio + video frames get decoded on both ends. Ends
-by hanging up and checking the call record was saved correctly.
+in-memory mock), then simulates two app instances -- a doctor (caller) and
+a patient (callee) -- doing everything the real mobile app does: signup,
+an appointment being scheduled (required before a call can be placed --
+see the doctor-only-initiation rule enforced in ws_manager.py), login,
+WebSocket signaling (call:invite/accept), a real WebRTC SDP offer/answer +
+ICE negotiation (using aiortc, a real WebRTC stack), and then confirms
+actual audio + video frames get decoded on both ends. Ends by hanging up
+and checking the call record was saved correctly.
 
-If you see "RESULT: 15 passed, 0 failed" at the end, the video calling
+If you see "RESULT: 16 passed, 0 failed" at the end, the video calling
 feature works on your machine.
 
 Not covered by this check: the React Native UI/native modules, a real
@@ -76,9 +78,9 @@ async def run_call_simulation():
     import aioice.ice as _aioice_ice
     _aioice_ice.get_host_addresses = lambda use_ipv4, use_ipv6: (["127.0.0.1"] if use_ipv4 else [])
 
-    def signup(name, email):
+    def signup(name, email, role):
         r = requests.post(f"{BASE}/auth/signup", json={
-            "name": name, "email": email, "password": "testpass123", "role": "freelancer"
+            "name": name, "email": email, "password": "testpass123", "role": role
         })
         r.raise_for_status()
         return r.json()
@@ -150,16 +152,24 @@ async def run_call_simulation():
             except Exception as e:
                 print(f"    [{self.label}] track consume ended: {e}")
 
-    print("1. Signing up two users (real /auth/signup, real password hashing + JWT)")
-    a = signup("Local Check - Caller", "local.caller@example.com")
-    b = signup("Local Check - Callee", "local.callee@example.com")
-    check("signup A", "access_token" in a)
-    check("signup B", "access_token" in b)
+    print("1. Signing up a doctor and a patient (real /auth/signup, real password hashing + JWT)")
+    a = signup("Dr. Local Check", "local.doctor@example.com", "doctor")
+    b = signup("Local Check Patient", "local.patient@example.com", "patient")
+    check("signup A (doctor)", "access_token" in a)
+    check("signup B (patient)", "access_token" in b)
 
     peer_a = Peer("A/caller", a["user"], a["access_token"])
     peer_b = Peer("B/callee", b["user"], b["access_token"])
     peer_a.other_id = b["user"]["id"]
     peer_b.other_id = a["user"]["id"]
+
+    print("\n1b. Doctor creates an appointment with the patient (required before call:invite is allowed)")
+    appt = requests.post(
+        f"{BASE}/appointments",
+        headers={"Authorization": f"Bearer {a['access_token']}"},
+        json={"patient_id": peer_a.other_id, "scheduled_time": "2026-08-20T10:00:00Z"},
+    )
+    check("appointment created", appt.status_code == 201)
 
     print("\n2. Opening WebSocket signaling connections for both users")
     await peer_a.connect_ws()

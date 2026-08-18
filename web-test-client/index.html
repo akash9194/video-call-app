@@ -93,6 +93,24 @@
     <span class="link" onclick="logout()" style="margin:0">Log out</span>
   </div>
   <div id="user-list"></div>
+  <div id="appointments-panel" style="margin-top:16px; display:none">
+    <div style="font-size:13px; color:#94a3b8; margin-bottom:6px">Your appointments</div>
+    <div id="appointments-list"></div>
+  </div>
+</div>
+
+<div id="schedule-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); align-items:center; justify-content:center; z-index:20">
+  <div class="card" style="width:320px">
+    <h3 style="margin-top:0">Schedule appointment</h3>
+    <div style="font-size:13px; color:#94a3b8; margin-bottom:10px">with <span id="schedule-patient-name" style="color:white; font-weight:600"></span></div>
+    <div style="font-size:12px; color:#64748b; margin-bottom:4px">Date &amp; time</div>
+    <input id="schedule-time" type="datetime-local" />
+    <div style="font-size:12px; color:#64748b; margin-bottom:4px">Notes (optional)</div>
+    <input id="schedule-notes" placeholder="Reason for visit" />
+    <div id="schedule-error" style="color:#f87171; font-size:13px; display:none; margin-bottom:8px"></div>
+    <button onclick="confirmSchedule()">Create appointment</button>
+    <button class="secondary" onclick="closeScheduleModal()">Cancel</button>
+  </div>
 </div>
 
 <div id="incoming-modal">
@@ -199,6 +217,7 @@ function enterHome() {
   document.getElementById('home-title').textContent = 'Hi, ' + me.name;
   connectSignaling();
   loadUsers();
+  loadAppointments();
   usersPollTimer = setInterval(loadUsers, 3000);
 }
 
@@ -222,8 +241,12 @@ async function loadUsers() {
       const disabledAttr = u.is_online ? '' : 'disabled style="opacity:0.4"';
       const safeName = u.name.replace(/'/g, "");
       const canCallThisUser = canInitiateCalls && u.role === 'patient';
+      // A doctor can always try to schedule an appointment with a patient
+      // (doesn't require them to be online) -- calling still requires a
+      // 'scheduled' appointment to exist, enforced server-side.
       const callButtons = canCallThisUser
         ? '<div style="display:flex; gap:6px">' +
+          '<button style="width:auto; padding:8px 10px; background:#334155; font-size:12px" onclick="openScheduleModal(\'' + u.id + '\',\'' + safeName + '\')">Schedule</button>' +
           '<button style="width:auto; padding:8px 12px; background:#2563eb" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'audio\')">Voice</button>' +
           '<button style="width:auto; padding:8px 12px" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'video\')">Video</button>' +
           '</div>'
@@ -235,6 +258,72 @@ async function loadUsers() {
       list.appendChild(row);
     });
   } catch (e) { console.warn('loadUsers failed', e); }
+}
+
+// ---- appointments (doctor-only initiation requires one of these to
+// exist between the doctor and patient before a call can be placed) ----
+let scheduleForPatientId = null;
+
+function openScheduleModal(patientId, patientName) {
+  scheduleForPatientId = patientId;
+  document.getElementById('schedule-patient-name').textContent = patientName;
+  document.getElementById('schedule-time').value = '';
+  document.getElementById('schedule-notes').value = '';
+  document.getElementById('schedule-error').style.display = 'none';
+  document.getElementById('schedule-modal').style.display = 'flex';
+}
+function closeScheduleModal() {
+  document.getElementById('schedule-modal').style.display = 'none';
+  scheduleForPatientId = null;
+}
+async function confirmSchedule() {
+  const errEl = document.getElementById('schedule-error');
+  errEl.style.display = 'none';
+  const localTime = document.getElementById('schedule-time').value; // "YYYY-MM-DDTHH:mm"
+  if (!localTime) { errEl.textContent = 'Pick a date and time.'; errEl.style.display = 'block'; return; }
+  const notes = document.getElementById('schedule-notes').value.trim();
+  try {
+    const resp = await fetch(apiBase + '/appointments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({
+        patient_id: scheduleForPatientId,
+        scheduled_time: new Date(localTime).toISOString(),
+        notes: notes || null,
+      }),
+    });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || ('Request failed: ' + resp.status));
+    }
+    closeScheduleModal();
+    loadAppointments();
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.style.display = 'block';
+  }
+}
+
+async function loadAppointments() {
+  try {
+    const resp = await fetch(apiBase + '/appointments', { headers: { Authorization: 'Bearer ' + token } });
+    if (!resp.ok) return;
+    const appts = await resp.json();
+    const panel = document.getElementById('appointments-panel');
+    const list = document.getElementById('appointments-list');
+    if (appts.length === 0) { panel.style.display = 'none'; return; }
+    panel.style.display = 'block';
+    list.innerHTML = appts.map(a => {
+      const other = me.role === 'doctor' ? a.patient_name : a.doctor_name;
+      const when = new Date(a.scheduled_time).toLocaleString();
+      const statusColor = a.status === 'scheduled' ? '#22c55e' : (a.status === 'cancelled' ? '#f87171' : '#64748b');
+      return '<div class="row" style="padding:8px 12px">' +
+        '<div><div style="font-size:13px">' + other + '</div>' +
+        '<div style="font-size:11px; color:#64748b">' + when + '</div></div>' +
+        '<div style="font-size:11px; color:' + statusColor + '">' + a.status + '</div>' +
+        '</div>';
+    }).join('');
+  } catch (e) { console.warn('loadAppointments failed', e); }
 }
 
 // ---- signaling ----
