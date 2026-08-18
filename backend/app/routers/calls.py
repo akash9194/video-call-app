@@ -11,10 +11,12 @@ router = APIRouter(prefix="/calls", tags=["calls"])
 @router.get("/ice-servers", response_model=IceServersResponse)
 async def get_ice_servers(current_user: dict = Depends(get_current_user)):
     """
-    The RN app fetches this once at startup / before placing a call, and
-    passes it straight into the RTCPeerConnection config.
+    The RN app fetches this right before placing/answering a call (not
+    just once at startup, since TURN credentials are short-lived -- see
+    Settings.turn_credentials) and passes it straight into the
+    RTCPeerConnection config.
     """
-    return IceServersResponse(ice_servers=settings.ice_servers)
+    return IceServersResponse(ice_servers=settings.ice_servers(str(current_user["_id"])))
 
 
 @router.get("/history", response_model=list[CallOut])
