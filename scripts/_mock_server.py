@@ -23,6 +23,19 @@ os.environ.setdefault("JWT_SECRET_KEY", "local-selfcheck-secret")
 
 from app.main import app  # noqa: E402
 import uvicorn  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+# Serve the web test client from the same origin/port as the API. This is
+# test-only (kept out of backend/app/main.py, which is the real production
+# app) but it matters for phone testing: getUserMedia (camera/mic) requires
+# a "secure context" in mobile Safari, and same-origin means a single https
+# tunnel (e.g. ngrok) covers both the page and its API calls with no
+# mixed-content or CORS issues -- no second tunnel needed.
+WEB_CLIENT_DIR = os.path.join(SCRIPT_DIR, "..", "web-test-client")
+app.mount("/test", StaticFiles(directory=WEB_CLIENT_DIR, html=True), name="test-client")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8123, log_level="warning")
+    # 0.0.0.0, not 127.0.0.1: lets other devices on the same wifi (e.g. a
+    # phone running Safari against the web test client) reach this server
+    # by the machine's LAN IP, not just localhost on this machine.
+    uvicorn.run(app, host="0.0.0.0", port=8123, log_level="warning")
