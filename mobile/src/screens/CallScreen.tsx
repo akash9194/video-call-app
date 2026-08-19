@@ -3,6 +3,14 @@ import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 import { RTCView } from 'react-native-webrtc';
 import { useCall } from '../context/CallContext';
 
+// Epic §23 network-quality indicator styling.
+const QUALITY_LABEL: Record<string, string> = { good: 'Good connection', fair: 'Fair connection', poor: 'Poor connection' };
+const QUALITY_COLOR: Record<string, { color: string }> = {
+  good: { color: '#22c55e' },
+  fair: { color: '#eab308' },
+  poor: { color: '#f87171' },
+};
+
 export default function CallScreen() {
   const {
     status,
@@ -12,6 +20,7 @@ export default function CallScreen() {
     isMuted,
     isVideoOn,
     isRemoteVideoOn,
+    networkQuality,
     endCall,
     toggleMute,
     switchToVideo,
@@ -42,6 +51,11 @@ export default function CallScreen() {
       <View style={styles.topBar}>
         <Text style={styles.callerName}>{remoteUserName}</Text>
         <Text style={styles.callStatus}>{status === 'active' ? 'Connected' : status}</Text>
+        {networkQuality && networkQuality !== 'unknown' && (
+          <Text style={[styles.networkQuality, QUALITY_COLOR[networkQuality]]}>
+            {QUALITY_LABEL[networkQuality]}
+          </Text>
+        )}
       </View>
 
       <View style={styles.controls}>
@@ -51,7 +65,17 @@ export default function CallScreen() {
         <TouchableOpacity style={[styles.controlButton, styles.endCall]} onPress={endCall}>
           <Text style={styles.controlIcon}>End</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.controlButton} onPress={isVideoOn ? switchToVoice : switchToVideo}>
+        <TouchableOpacity
+          style={styles.controlButton}
+          // switchToVoice takes an optional `auto` flag (epic §21 -- lets
+          // the backend tell a manual tap apart from the automatic
+          // poor-connection fallback). onPress hands its handler a
+          // GestureResponderEvent as the first argument, which is truthy
+          // and would otherwise get passed straight through as `auto`,
+          // mislabeling every manual switch as automatic in the audit
+          // trail -- wrap it so no arguments reach switchToVoice here.
+          onPress={() => (isVideoOn ? switchToVoice() : switchToVideo())}
+        >
           <Text style={styles.controlIcon}>{isVideoOn ? 'Switch to voice' : 'Switch to video'}</Text>
         </TouchableOpacity>
       </View>
@@ -86,6 +110,7 @@ const styles = StyleSheet.create({
   topBar: { position: 'absolute', top: 50, left: 16 },
   callerName: { color: 'white', fontSize: 20, fontWeight: '700' },
   callStatus: { color: '#94a3b8', marginTop: 4, textTransform: 'capitalize' },
+  networkQuality: { marginTop: 2, fontSize: 12, fontWeight: '600' },
   controls: {
     position: 'absolute',
     bottom: 48,

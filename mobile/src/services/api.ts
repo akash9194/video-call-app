@@ -74,6 +74,18 @@ export const api = {
     return request('/calls/history');
   },
 
+  // Epic §30: post-call notes & outcome. Backend only accepts this once
+  // the call has reached a terminal status (see routers/calls.py's
+  // TERMINAL_STATUSES) -- no screen calls this yet (that's a follow-up UI
+  // piece), but the capability is here so a post-call notes screen can be
+  // wired up without touching the API layer again.
+  async addCallNotes(callId: string, notes: { notes?: string | null; outcome?: string | null; follow_up_required?: boolean }) {
+    return request(`/calls/${callId}/notes`, {
+      method: 'PATCH',
+      body: JSON.stringify(notes),
+    });
+  },
+
   // Doctor-only initiation requires an active appointment with the
   // patient before call:invite is allowed -- see backend/app/signaling/
   // ws_manager.py. These are the mobile equivalents of the web test

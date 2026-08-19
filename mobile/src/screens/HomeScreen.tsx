@@ -8,7 +8,7 @@ import { NavProp } from '../navigation';
 
 export default function HomeScreen({ navigation }: { navigation: NavProp }) {
   const { user, logout } = useAuth();
-  const { startCall } = useCall();
+  const { status, remoteUserId, startCall } = useCall();
   const [users, setUsers] = useState<User[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [refreshing, setRefreshing] = useState(false);
@@ -34,6 +34,10 @@ export default function HomeScreen({ navigation }: { navigation: NavProp }) {
   // the real enforcement lives on the backend since a client can't be
   // trusted to police itself.
   const canInitiateCalls = user?.role === 'doctor';
+  // Epic §7 entry-point button states. selfBusy covers "Call in Progress" --
+  // any non-idle call status means we're already ringing/connected on
+  // some call, so every OTHER user's row gets disabled with that reason.
+  const selfBusy = status !== 'idle';
 
   return (
     <View style={styles.container}>
@@ -57,11 +61,29 @@ export default function HomeScreen({ navigation }: { navigation: NavProp }) {
         renderItem={({ item }) => {
           // Doctors can only call patients (mirrors the backend check).
           const canCallThisUser = canInitiateCalls && item.role === 'patient';
+
+          // Epic §7: the specific state set (Calling.../Patient Busy/Call
+          // in Progress/Video Call Unavailable), checked in priority order.
+          let buttonState: { label: string; disabled: true } | null = null;
+          if (canCallThisUser) {
+            if (status === 'calling' && remoteUserId === item.id) {
+              buttonState = { label: 'Calling…', disabled: true };
+            } else if (selfBusy) {
+              buttonState = { label: 'Call in Progress', disabled: true };
+            } else if (!item.is_online) {
+              buttonState = { label: 'Video Call Unavailable', disabled: true };
+            } else if (item.in_active_call) {
+              buttonState = { label: 'Patient Busy', disabled: true };
+            }
+          }
+
           return (
             <View style={styles.row}>
               <View>
                 <Text style={styles.name}>{item.name}</Text>
-                <Text style={styles.status}>{item.is_online ? 'Online' : 'Offline'} · {item.role}</Text>
+                <Text style={styles.status}>
+                  {item.is_online ? 'Online' : 'Offline'} · {item.role}{item.in_active_call ? ' · On a call' : ''}
+                </Text>
               </View>
               {canCallThisUser && (
                 <View style={{ flexDirection: 'row', gap: 8 }}>
@@ -71,20 +93,26 @@ export default function HomeScreen({ navigation }: { navigation: NavProp }) {
                   >
                     <Text style={styles.scheduleButtonText}>Schedule</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.callButton, styles.voiceButton, !item.is_online && styles.callButtonDisabled]}
-                    disabled={!item.is_online}
-                    onPress={() => startCall(item.id, item.name, 'audio')}
-                  >
-                    <Text style={styles.callButtonText}>Voice</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.callButton, !item.is_online && styles.callButtonDisabled]}
-                    disabled={!item.is_online}
-                    onPress={() => startCall(item.id, item.name, 'video')}
-                  >
-                    <Text style={styles.callButtonText}>Video</Text>
-                  </TouchableOpacity>
+                  {buttonState ? (
+                    <View style={[styles.callButton, styles.callButtonDisabled]}>
+                      <Text style={styles.callButtonText}>{buttonState.label}</Text>
+                    </View>
+                  ) : (
+                    <>
+                      <TouchableOpacity
+                        style={[styles.callButton, styles.voiceButton]}
+                        onPress={() => startCall(item.id, item.name, 'audio')}
+                      >
+                        <Text style={styles.callButtonText}>Voice</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.callButton}
+                        onPress={() => startCall(item.id, item.name, 'video')}
+                      >
+                        <Text style={styles.callButtonText}>Video</Text>
+                      </TouchableOpacity>
+                    </>
+                  )}
                 </View>
               )}
             </View>

@@ -127,6 +127,32 @@
   </div>
 </div>
 
+<div id="notes-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); align-items:center; justify-content:center; z-index:20">
+  <div class="card" style="width:340px">
+    <h3 style="margin-top:0">Add call notes (optional)</h3>
+    <div style="font-size:12px; color:#64748b; margin-bottom:4px">Notes</div>
+    <textarea id="notes-text" rows="4" style="width:100%; box-sizing:border-box; background:#0f172a; color:white; border:1px solid #334155; border-radius:6px; padding:8px; font-family:inherit"></textarea>
+    <div style="font-size:12px; color:#64748b; margin:8px 0 4px">Outcome</div>
+    <select id="notes-outcome" style="width:100%; box-sizing:border-box; background:#0f172a; color:white; border:1px solid #334155; border-radius:6px; padding:8px">
+      <option value="">-- not set --</option>
+      <option value="RESOLVED">Resolved</option>
+      <option value="FOLLOW_UP_REQUIRED">Follow-up required</option>
+      <option value="REFERRED">Referred</option>
+      <option value="ESCALATED">Escalated</option>
+      <option value="NO_CLINICAL_ACTION">No clinical action</option>
+    </select>
+    <label style="display:flex; align-items:center; gap:8px; margin-top:10px; font-size:13px; color:#cbd5e1">
+      <input type="checkbox" id="notes-followup" />
+      <span>Flag for follow-up</span>
+    </label>
+    <div id="notes-error" style="color:#f87171; font-size:13px; display:none; margin-top:8px"></div>
+    <div style="display:flex; gap:10px; margin-top:14px">
+      <button class="secondary" onclick="closeNotesModal()">Skip</button>
+      <button onclick="submitCallNotes()">Save notes</button>
+    </div>
+  </div>
+</div>
+
 <div id="incoming-modal">
   <div class="avatar" id="incoming-avatar"></div>
   <div id="incoming-name" style="font-size:18px; font-weight:600"></div>
@@ -141,6 +167,8 @@
   </div>
 </div>
 
+<div id="toast" style="display:none; position:fixed; top:16px; left:50%; transform:translateX(-50%); background:#1e293b; color:white; padding:10px 20px; border-radius:8px; font-size:14px; box-shadow:0 4px 12px rgba(0,0,0,0.4); z-index:50; max-width:320px; text-align:center"></div>
+
 <div id="call-screen">
   <video id="remote-video" autoplay playsinline></video>
   <div id="remote-placeholder" style="position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:8px">
@@ -151,6 +179,7 @@
   <div id="call-topbar">
     <div id="call-peer-name" style="font-weight:600"></div>
     <div id="call-status" style="color:#94a3b8; font-size:13px"></div>
+    <div id="network-quality" style="font-size:12px; display:none; margin-top:2px"></div>
   </div>
   <div id="call-controls">
     <button class="ctrl-btn" onclick="toggleMute()" id="mute-btn">Mute</button>
@@ -159,12 +188,18 @@
   </div>
 </div>
 
+<script src="network-quality.js"></script>
 <script>
 // ---- state ----
 let apiBase = document.getElementById('api-base').value;
 let token = null, me = null, ws = null;
 let authMode = 'login';
 let callId = null, otherId = null, otherName = null;
+// Epic §7 -- who we're actively ringing (set on placeCall, cleared once
+// accepted/rejected/timed out/cancelled). Distinct from callId, which is
+// only known once accepted -- this is what drives the "Calling..." button
+// state on that specific user's row while we wait.
+let callingTargetId = null;
 let pc = null, localStream = null, isMuted = false;
 let initialMedia = 'video'; // how the current call started -- set by placeCall or call:incoming
 let isVideoOn = false;      // do we currently have a live local video track in this call?
@@ -177,6 +212,11 @@ let statsTimer = null, poorVideoStreak = 0, lastVideoStats = null;
 // Business/Medical-approved before it's allowed to run at all. Fetched
 // fresh from /calls/ice-servers at the start of every call.
 let audioOnlyAutoFallbackEnabled = false;
+// Epic §23 network-quality indicator -- independent of the fallback flag
+// above (it's purely informational, doesn't switch media), so it polls on
+// every call. lastAudioStats/lastReportedQuality avoid re-sending the
+// same bucket to the peer on every 5s tick.
+let lastAudioStats = null, lastReportedQuality = null;
 
 // A stable per-browser device_id, persisted across reloads, is what lets a
 // dropped WebSocket reconnect as the SAME device server-side (see
@@ -276,25 +316,44 @@ async function loadUsers() {
     // ws_manager.py's call:invite handler, since this client-side check
     // can't be trusted as the actual security boundary.
     const canInitiateCalls = me.role === 'doctor';
+    // Epic §7 entry-point button states. selfBusy covers "Call in
+    // Progress" (we're already on a call, or actively ringing someone) --
+    // everyone else's row gets disabled with that reason while it's true,
+    // regardless of their own online/busy status.
+    const selfBusy = callId !== null || callingTargetId !== null;
     users.forEach(u => {
       const row = document.createElement('div');
       row.className = 'row';
-      const disabledAttr = u.is_online ? '' : 'disabled style="opacity:0.4"';
       const safeName = u.name.replace(/'/g, "");
       const canCallThisUser = canInitiateCalls && u.role === 'patient';
-      // A doctor can always try to schedule an appointment with a patient
-      // (doesn't require them to be online) -- calling still requires a
-      // 'scheduled' appointment to exist, enforced server-side.
+
+      let buttonState = null; // { disabled, label, title } or null = normal enabled state
+      let title = '';
+      if (canCallThisUser) {
+        if (callingTargetId === u.id) {
+          buttonState = { disabled: true, label: 'Calling…', title: 'Ringing -- waiting for them to answer' };
+        } else if (selfBusy) {
+          buttonState = { disabled: true, label: 'Call in Progress', title: "You're already on a call -- end it before starting another" };
+        } else if (!u.is_online) {
+          buttonState = { disabled: true, label: 'Video Call Unavailable', title: `${safeName} is offline` };
+        } else if (u.in_active_call) {
+          buttonState = { disabled: true, label: 'Patient Busy', title: `${safeName} is already on another call` };
+        }
+      }
+
+      const disabledAttr = buttonState ? 'disabled style="opacity:0.5"' : '';
       const callButtons = canCallThisUser
         ? '<div style="display:flex; gap:6px">' +
           '<button style="width:auto; padding:8px 10px; background:#334155; font-size:12px" onclick="openScheduleModal(\'' + u.id + '\',\'' + safeName + '\')">Schedule</button>' +
-          '<button style="width:auto; padding:8px 12px; background:#2563eb" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'audio\')">Voice</button>' +
-          '<button style="width:auto; padding:8px 12px" ' + disabledAttr + ' onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'video\')">Video</button>' +
+          (buttonState
+            ? '<button style="width:auto; padding:8px 12px; background:#475569; font-size:12px" disabled title="' + buttonState.title + '">' + buttonState.label + '</button>'
+            : '<button style="width:auto; padding:8px 12px; background:#2563eb" title="Start a voice-only call" onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'audio\')">Voice</button>' +
+              '<button style="width:auto; padding:8px 12px" title="Start a video call" onclick="placeCall(\'' + u.id + '\',\'' + safeName + '\',\'video\')">Video</button>') +
           '</div>'
         : '';
       row.innerHTML =
         '<div><div style="font-weight:600; font-size:14px">' + u.name + '</div>' +
-        '<div style="font-size:12px; color:#94a3b8"><span class="status-dot" style="background:' + (u.is_online ? '#22c55e' : '#64748b') + '"></span>' + (u.is_online ? 'Online' : 'Offline') + ' · ' + u.role + '</div></div>' +
+        '<div style="font-size:12px; color:#94a3b8"><span class="status-dot" style="background:' + (u.is_online ? '#22c55e' : '#64748b') + '"></span>' + (u.is_online ? 'Online' : 'Offline') + ' · ' + u.role + (u.in_active_call ? ' · On a call' : '') + '</div></div>' +
         callButtons;
       list.appendChild(row);
     });
@@ -410,6 +469,8 @@ async function handleSignal(msg) {
       break;
     case 'call:accepted':
       callId = msg.call_id;
+      callingTargetId = null; // no longer "Calling..." -- selfBusy (callId !== null) takes over as "Call in Progress"
+      refreshUserListButtons();
       document.getElementById('call-status').textContent = 'Connecting...';
       await setupPeerConnection(initialMedia === 'video');
       const offer = await pc.createOffer();
@@ -445,6 +506,13 @@ async function handleSignal(msg) {
       isRemoteVideoOn = msg.media === 'video';
       updateRemoteVideoVisibility();
       break;
+    case 'call:network-quality':
+      // The peer's report of how THEY'RE experiencing the call (epic
+      // §23) -- purely informational, doesn't drive any auto-behavior on
+      // this side. Logged for now; a fuller UI could show both
+      // directions side by side.
+      console.log('[quality] peer reports', msg.quality);
+      break;
     case 'error':
       if (msg.code === 'consent_required') {
         // Shouldn't normally happen -- the Accept button is disabled until
@@ -462,14 +530,16 @@ async function handleSignal(msg) {
         cleanupCall();
       }
       break;
-    case 'call:timeout':
+    case 'call:timeout': {
       // We were the caller and nobody answered in time. callId is still
       // null at this point (we only learn it from call:accepted, which
       // never came) -- there's nothing to compare msg.call_id against, so
       // just handle it directly, same as call:rejected/cancelled pre-accept.
-      alert('No answer -- call timed out.');
+      const calledName = otherName;
       cleanupCall();
+      showToast(calledName ? `${calledName} didn't answer. Try again anytime.` : "No answer.");
       break;
+    }
     case 'call:peer-disconnected':
       // The other side's connection just dropped (wifi hiccup, backgrounded
       // app, ...) -- the call isn't over yet, the server gives them a grace
@@ -483,8 +553,24 @@ async function handleSignal(msg) {
         document.getElementById('call-status').textContent = pc.connectionState;
       }
       break;
+    case 'call:cancelled': {
+      // Ignore a message for a call_id that isn't the one we're currently
+      // in (late/stale message for a call already replaced by a new one).
+      if (callId !== null && msg.call_id && msg.call_id !== callId) break;
+      // Epic §31: if we were the callee and this is the ringing timing out
+      // (not the caller manually cancelling), show a friendly, non-alarming
+      // "you missed a call" notice instead of just silently dismissing the
+      // incoming-call screen -- today's behavior before this was to show
+      // nothing at all, which is confusing ("did my phone just glitch?").
+      const wasRinging = document.getElementById('incoming-modal').style.display === 'flex';
+      const missedFrom = otherName;
+      cleanupCall();
+      if (wasRinging && msg.reason === 'timeout') {
+        showToast(missedFrom ? `You missed a video call from ${missedFrom}.` : 'You missed a call.');
+      }
+      break;
+    }
     case 'call:rejected':
-    case 'call:cancelled':
     case 'call:ended':
     case 'call:user-offline':
     case 'call:answered_elsewhere':
@@ -503,16 +589,34 @@ async function handleSignal(msg) {
   }
 }
 
+let toastTimer = null;
+function showToast(text) {
+  const el = document.getElementById('toast');
+  el.textContent = text;
+  el.style.display = 'block';
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = 'none'; }, 5000);
+}
+
 // ---- call actions ----
 async function placeCall(id, name, media) {
   callId = null; otherId = id; otherName = name;
+  callingTargetId = id;
   initialMedia = media === 'audio' ? 'audio' : 'video';
-  send({ type: 'call:invite', to: id, media: initialMedia });
+  send({ type: 'call:invite', to: id, media: initialMedia, platform: 'web' });
   document.getElementById('call-peer-name').textContent = name;
   document.getElementById('call-status').textContent = 'Calling...';
   document.getElementById('call-screen').style.display = 'block';
   isVideoOn = false; isRemoteVideoOn = false;
   updateLocalVideoVisibility(); updateRemoteVideoVisibility(); updateSwitchButton();
+  refreshUserListButtons();
+}
+
+// Re-render just the button states in the user list without waiting for
+// the next 3s poll -- called right after an action that changes selfBusy/
+// callingTargetId, so the UI reflects it immediately.
+function refreshUserListButtons() {
+  if (document.getElementById('home-view').style.display !== 'none') loadUsers();
 }
 
 async function acceptCall() {
@@ -528,7 +632,7 @@ async function acceptCall() {
   isRemoteVideoOn = false;
   updateRemoteVideoVisibility();
   await setupPeerConnection(initialMedia === 'video');
-  send({ type: 'call:accept', call_id: callId, to: otherId, consent: true });
+  send({ type: 'call:accept', call_id: callId, to: otherId, consent: true, platform: 'web' });
 }
 
 function rejectCall() {
@@ -582,10 +686,11 @@ async function setupPeerConnection(wantVideo) {
 // way either way.
 function startStatsMonitor() {
   stopStatsMonitor();
-  // Gated by the backend flag (epic §21) -- don't even poll if automatic
-  // fallback isn't approved/enabled, so there's no ambiguity about why it
-  // isn't kicking in.
-  if (!audioOnlyAutoFallbackEnabled) return;
+  // Unlike the old version of this function, polling itself is NOT gated
+  // on audioOnlyAutoFallbackEnabled anymore -- the network-quality
+  // indicator (epic §23) is informational only and should work on every
+  // call. Only the actual auto-switch-to-audio decision inside
+  // monitorCallQuality() below stays gated behind that flag.
   statsTimer = setInterval(monitorCallQuality, 5000);
 }
 function stopStatsMonitor() {
@@ -593,22 +698,63 @@ function stopStatsMonitor() {
   statsTimer = null;
   poorVideoStreak = 0;
   lastVideoStats = null;
+  lastAudioStats = null;
+  lastReportedQuality = null;
+  updateNetworkQualityIndicator(null);
 }
+
+function updateNetworkQualityIndicator(quality) {
+  const el = document.getElementById('network-quality');
+  if (!el) return;
+  if (!quality || quality === 'unknown') { el.style.display = 'none'; return; }
+  const labels = { good: 'Good connection', fair: 'Fair connection', poor: 'Poor connection' };
+  const colors = { good: '#22c55e', fair: '#eab308', poor: '#f87171' };
+  el.textContent = labels[quality] || quality;
+  el.style.color = colors[quality] || '#94a3b8';
+  el.style.display = 'block';
+}
+
 async function monitorCallQuality() {
-  if (!pc || !isVideoOn) { poorVideoStreak = 0; lastVideoStats = null; return; }
+  if (!pc) { poorVideoStreak = 0; lastVideoStats = null; lastAudioStats = null; return; }
   try {
     const stats = await pc.getStats();
-    let report = null;
-    stats.forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'video') report = r; });
-    if (!report) return;
-    const now = { packetsLost: report.packetsLost || 0, packetsReceived: report.packetsReceived || 0 };
+    let videoReport = null, audioReport = null;
+    stats.forEach(r => {
+      if (r.type === 'inbound-rtp' && r.kind === 'video') videoReport = r;
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') audioReport = r;
+    });
+
+    // -- Quality indicator (epic §23): audio track exists on every call
+    // (video is optional), so it's the more general signal for "how's
+    // this call doing overall" -- sent to the peer and shown locally.
+    if (audioReport) {
+      const nowA = { packetsLost: audioReport.packetsLost || 0, packetsReceived: audioReport.packetsReceived || 0 };
+      if (lastAudioStats) {
+        const dLost = Math.max(0, nowA.packetsLost - lastAudioStats.packetsLost);
+        const dRecv = Math.max(0, nowA.packetsReceived - lastAudioStats.packetsReceived);
+        const total = dLost + dRecv;
+        const lossRatio = total > 0 ? dLost / total : 0;
+        const quality = bucketNetworkQuality(lossRatio);
+        updateNetworkQualityIndicator(quality);
+        if (quality !== lastReportedQuality && callId && otherId) {
+          lastReportedQuality = quality;
+          send({ type: 'call:network-quality', call_id: callId, to: otherId, quality });
+        }
+      }
+      lastAudioStats = nowA;
+    }
+
+    // -- Automatic audio-only fallback (epic §21, gated behind the
+    // backend flag) -- unchanged logic, video-specific sustained loss.
+    if (!isVideoOn || !videoReport) { poorVideoStreak = 0; lastVideoStats = null; return; }
+    const now = { packetsLost: videoReport.packetsLost || 0, packetsReceived: videoReport.packetsReceived || 0 };
     if (lastVideoStats) {
       const dLost = Math.max(0, now.packetsLost - lastVideoStats.packetsLost);
       const dRecv = Math.max(0, now.packetsReceived - lastVideoStats.packetsReceived);
       const total = dLost + dRecv;
       const lossRatio = total > 0 ? dLost / total : 0;
       poorVideoStreak = lossRatio > 0.08 ? poorVideoStreak + 1 : 0;
-      if (poorVideoStreak >= 3) {
+      if (poorVideoStreak >= 3 && audioOnlyAutoFallbackEnabled) {
         poorVideoStreak = 0;
         console.warn('Sustained poor video conditions -- auto-falling back to audio-only');
         switchToVoice(true); // true = automatic, so the backend tags this call's audit record distinctly (audio_only_fallback_occurred)
@@ -697,10 +843,63 @@ function cleanupCall() {
   document.getElementById('call-screen').style.display = 'none';
   if (pc) { pc.close(); pc = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  // Epic §30: offer to add post-call notes/outcome once the call is
+  // actually over. Backend only accepts this once the call record has
+  // reached a terminal status, which is true by the time cleanupCall runs
+  // for any call that had a real call_id (declined/no-answer/cancelled/
+  // ended/dropped are all terminal -- see routers/calls.py's
+  // TERMINAL_STATUSES). Purely optional -- the modal can be skipped.
+  if (callId) openNotesModal(callId);
   callId = null; otherId = null; otherName = null;
+  callingTargetId = null;
   isMuted = false; isVideoOn = false; isRemoteVideoOn = false;
   document.getElementById('mute-btn').textContent = 'Mute';
   updateSwitchButton();
+  refreshUserListButtons();
+}
+
+let notesCallId = null;
+
+function openNotesModal(forCallId) {
+  notesCallId = forCallId;
+  document.getElementById('notes-text').value = '';
+  document.getElementById('notes-outcome').value = '';
+  document.getElementById('notes-followup').checked = false;
+  document.getElementById('notes-error').style.display = 'none';
+  document.getElementById('notes-modal').style.display = 'flex';
+}
+
+function closeNotesModal() {
+  document.getElementById('notes-modal').style.display = 'none';
+  notesCallId = null;
+}
+
+async function submitCallNotes() {
+  if (!notesCallId) return closeNotesModal();
+  const body = {
+    notes: document.getElementById('notes-text').value || null,
+    outcome: document.getElementById('notes-outcome').value || null,
+    follow_up_required: document.getElementById('notes-followup').checked,
+  };
+  const errEl = document.getElementById('notes-error');
+  errEl.style.display = 'none';
+  try {
+    const resp = await fetch(apiBase + '/calls/' + notesCallId + '/notes', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      errEl.textContent = err.detail || ('Request failed: ' + resp.status);
+      errEl.style.display = 'block';
+      return;
+    }
+    closeNotesModal();
+  } catch (e) {
+    errEl.textContent = 'Network error saving notes.';
+    errEl.style.display = 'block';
+  }
 }
 
 function toggleMute() {

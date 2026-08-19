@@ -1,11 +1,12 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
-import { Alert } from 'react-native';
+import { Alert, Platform } from 'react-native';
 import InCallManager from 'react-native-incall-manager';
 import { MediaStream } from 'react-native-webrtc';
 
 import { signalingClient } from '../services/signaling';
 import { api } from '../services/api';
 import { createPeerConnection, getLocalStream, RTCIceCandidate, RTCSessionDescription } from '../services/webrtc';
+import { bucketNetworkQuality, NetworkQuality } from '../services/networkQuality';
 import { CallStatus, CallMedia, SignalingMessage } from '../types';
 import { navigate } from '../navigation';
 import { useAuth } from './AuthContext';
@@ -20,6 +21,7 @@ interface CallContextValue {
   isMuted: boolean;
   isVideoOn: boolean; // do we currently have a live local video track in this call?
   isRemoteVideoOn: boolean; // is the OTHER side currently sending video?
+  networkQuality: NetworkQuality | null; // epic §23 -- our own outbound-facing view of the call's quality
   startCall: (calleeId: string, calleeName: string, media: CallMedia) => Promise<void>;
   acceptCall: (consent: boolean) => Promise<void>;
   rejectCall: () => void;
@@ -64,6 +66,11 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   const audioOnlyAutoFallbackEnabledRef = useRef(false);
   const poorVideoStreakRef = useRef(0);
   const lastVideoStatsRef = useRef<{ packetsLost: number; packetsReceived: number } | null>(null);
+  // Epic §23 network-quality indicator -- independent of the fallback flag
+  // above, so it polls on every call regardless.
+  const lastAudioStatsRef = useRef<{ packetsLost: number; packetsReceived: number } | null>(null);
+  const lastReportedQualityRef = useRef<NetworkQuality | null>(null);
+  const [networkQuality, setNetworkQuality] = useState<NetworkQuality | null>(null);
   const callIdRef = useRef<string | null>(null);
   const remoteUserIdRef = useRef<string | null>(null);
   const isVideoOnRef = useRef(false);
@@ -76,31 +83,68 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     statsTimerRef.current = null;
     poorVideoStreakRef.current = 0;
     lastVideoStatsRef.current = null;
+    lastAudioStatsRef.current = null;
+    lastReportedQualityRef.current = null;
+    setNetworkQuality(null);
   };
 
-  // Polls WebRTC stats every 5s while a call has live video, and if the
-  // receiving side sees sustained heavy packet loss on the video track (3
-  // consecutive bad polls, ~15s) auto-switches to audio-only rather than
-  // leaving both sides stuck with a frozen/stuttering picture -- a clean
-  // fallback beats an unpredictable one.
+  // Polls WebRTC stats every 5s for the lifetime of a call. Two independent
+  // things happen off the same poll:
+  //   1. Network-quality indicator (epic §23, always on): bucketed from the
+  //      audio track's packet-loss ratio, since audio exists on every call
+  //      (video is optional) -- relayed to the peer via call:network-quality
+  //      and reflected locally via `networkQuality`.
+  //   2. Automatic audio-only fallback (epic §21, gated behind the backend
+  //      flag): sustained heavy loss on the VIDEO track for 3 consecutive
+  //      polls (~15s) triggers switchToVoice(true).
   const startStatsMonitor = () => {
     stopStatsMonitor();
-    if (!audioOnlyAutoFallbackEnabledRef.current) return;
     statsTimerRef.current = setInterval(async () => {
       const pc = pcRef.current;
-      if (!pc || !isVideoOnRef.current) {
+      if (!pc) {
         poorVideoStreakRef.current = 0;
         lastVideoStatsRef.current = null;
+        lastAudioStatsRef.current = null;
         return;
       }
       try {
         const stats = await pc.getStats();
-        let report: any = null;
+        let videoReport: any = null;
+        let audioReport: any = null;
         stats.forEach((r: any) => {
-          if (r.type === 'inbound-rtp' && r.kind === 'video') report = r;
+          if (r.type === 'inbound-rtp' && r.kind === 'video') videoReport = r;
+          if (r.type === 'inbound-rtp' && r.kind === 'audio') audioReport = r;
         });
-        if (!report) return;
-        const now = { packetsLost: report.packetsLost || 0, packetsReceived: report.packetsReceived || 0 };
+
+        if (audioReport) {
+          const nowA = { packetsLost: audioReport.packetsLost || 0, packetsReceived: audioReport.packetsReceived || 0 };
+          const lastA = lastAudioStatsRef.current;
+          if (lastA) {
+            const dLost = Math.max(0, nowA.packetsLost - lastA.packetsLost);
+            const dRecv = Math.max(0, nowA.packetsReceived - lastA.packetsReceived);
+            const total = dLost + dRecv;
+            const lossRatio = total > 0 ? dLost / total : 0;
+            const quality = bucketNetworkQuality(lossRatio);
+            setNetworkQuality(quality);
+            if (quality !== lastReportedQualityRef.current && callIdRef.current && remoteUserIdRef.current) {
+              lastReportedQualityRef.current = quality;
+              signalingClient.send({
+                type: 'call:network-quality',
+                call_id: callIdRef.current,
+                to: remoteUserIdRef.current,
+                quality,
+              });
+            }
+          }
+          lastAudioStatsRef.current = nowA;
+        }
+
+        if (!isVideoOnRef.current || !videoReport) {
+          poorVideoStreakRef.current = 0;
+          lastVideoStatsRef.current = null;
+          return;
+        }
+        const now = { packetsLost: videoReport.packetsLost || 0, packetsReceived: videoReport.packetsReceived || 0 };
         const last = lastVideoStatsRef.current;
         if (last) {
           const dLost = Math.max(0, now.packetsLost - last.packetsLost);
@@ -108,7 +152,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           const total = dLost + dRecv;
           const lossRatio = total > 0 ? dLost / total : 0;
           poorVideoStreakRef.current = lossRatio > 0.08 ? poorVideoStreakRef.current + 1 : 0;
-          if (poorVideoStreakRef.current >= 3) {
+          if (poorVideoStreakRef.current >= 3 && audioOnlyAutoFallbackEnabledRef.current) {
             poorVideoStreakRef.current = 0;
             console.warn('[call] sustained poor video conditions -- auto-falling back to audio-only');
             switchToVoice(true);
@@ -180,7 +224,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     setStatus('calling');
     setRemoteUserId(calleeId);
     setRemoteUserName(calleeName);
-    signalingClient.send({ type: 'call:invite', to: calleeId, media });
+    signalingClient.send({ type: 'call:invite', to: calleeId, media, platform: Platform.OS });
     // call_id + offer creation happens once the callee accepts (see call:accepted below)
   };
 
@@ -195,7 +239,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     setStatus('connecting');
     InCallManager.start({ media: 'video' });
     await setupPeerConnection(remoteUserId, callId, initialMediaRef.current);
-    signalingClient.send({ type: 'call:accept', call_id: callId, to: remoteUserId, consent: true });
+    signalingClient.send({ type: 'call:accept', call_id: callId, to: remoteUserId, consent: true, platform: Platform.OS });
     // Offer will arrive from the caller next; we answer it in the message handler.
   };
 
@@ -375,6 +419,15 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           break;
         }
 
+        case 'call:network-quality': {
+          // The peer's report of how THEY'RE experiencing the call (epic
+          // §23) -- purely informational today, doesn't drive any
+          // auto-behavior on this side (that stays scoped to our own
+          // outbound view, set in startStatsMonitor above).
+          console.log('[call] peer reports network quality:', msg.quality);
+          break;
+        }
+
         case 'error': {
           if (msg.code === 'consent_required') {
             // Shouldn't normally happen -- IncomingCallScreen disables
@@ -401,9 +454,10 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
 
         case 'call:timeout': {
           // We were the caller and nobody answered in time.
-          Alert.alert('No answer', 'The call timed out.');
+          const calledName = remoteUserName;
           resetCallState();
           navigate('Home');
+          Alert.alert('No answer', calledName ? `${calledName} didn't answer. You can try again anytime.` : "No answer.");
           break;
         }
 
@@ -421,8 +475,25 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           break;
         }
 
+        case 'call:cancelled': {
+          if (callId !== null && msg.call_id && msg.call_id !== callId) break;
+          // Epic §31: if we were the callee (ringing) and this is the call
+          // timing out rather than the caller manually cancelling, show a
+          // friendly, non-alarming "you missed a call" notice -- before
+          // this, the incoming-call screen just disappeared with no
+          // explanation at all.
+          const wasRinging = status === 'incoming';
+          const missedFrom = remoteUserName;
+          InCallManager.stopRingtone();
+          resetCallState();
+          navigate('Home');
+          if (wasRinging && msg.reason === 'timeout') {
+            Alert.alert('Missed call', missedFrom ? `You missed a video call from ${missedFrom}.` : 'You missed a call.');
+          }
+          break;
+        }
+
         case 'call:rejected':
-        case 'call:cancelled':
         case 'call:ended':
         case 'call:user-offline':
         case 'call:answered_elsewhere': {
@@ -487,6 +558,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         isMuted,
         isVideoOn,
         isRemoteVideoOn,
+        networkQuality,
         startCall,
         acceptCall,
         rejectCall,

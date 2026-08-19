@@ -11,8 +11,8 @@ this server.
 Protocol (all messages are JSON with a "type" field):
 
   Client -> Server
-    call:invite         { to: userId, media: "audio" | "video" }
-    call:accept         { call_id, to: userId, consent: true }
+    call:invite         { to: userId, media: "audio" | "video", platform?: "ios"|"android"|"web" }
+    call:accept         { call_id, to: userId, consent: true, platform?: "ios"|"android"|"web" }
     call:reject         { call_id, to: userId }
     call:cancel         { call_id, to: userId }
     call:end            { call_id, to: userId }
@@ -20,6 +20,7 @@ Protocol (all messages are JSON with a "type" field):
     webrtc:answer       { call_id, to: userId, sdp }
     webrtc:ice-candidate{ call_id, to: userId, candidate }
     call:media-switch   { call_id, to: userId, media: "audio" | "video", auto?: true }
+    call:network-quality{ call_id, to: userId, quality: "good" | "fair" | "poor" }
 
   Server -> Client
     call:incoming          { call_id, from: userId, from_name, media: "audio" | "video" }
@@ -34,6 +35,7 @@ Protocol (all messages are JSON with a "type" field):
     call:peer-reconnected   { call_id }   (they're back -- clear the "Reconnecting..." state)
     webrtc:offer / answer / ice-candidate  (relayed as-is)
     call:media-switch      { call_id, from: userId, media: "audio" | "video" }  (relayed as-is)
+    call:network-quality   { call_id, from: userId, quality: "good" | "fair" | "poor" }  (relayed as-is)
     presence:update         { user_id, is_online }
     error                   { message, code }
 
@@ -129,6 +131,13 @@ Persisted call.status values: RINGING, CONNECTED, DECLINED, NO_ANSWER,
 CANCELLED, ENDED, DROPPED (BUSY is rejected before a call record is ever
 created, so it never appears as a status). Every terminal transition also
 stamps an `end_reason` from schemas.call.END_REASONS.
+
+Analytics (epic §35, §36)
+------------------------
+Every lifecycle transition above also calls app.analytics.emit_event(),
+which both logs a structured line and writes to analytics_events_collection
+-- see that module for the full event-type list. Best-effort: a failure to
+persist an event never blocks or fails the signaling path that triggered it.
 """
 
 import asyncio
@@ -140,6 +149,7 @@ from datetime import datetime, timezone
 from fastapi import WebSocket
 from bson import ObjectId
 
+from app.analytics import emit_event
 from app.config import settings
 from app.database import appointments_collection, calls_collection, users_collection
 
@@ -248,6 +258,7 @@ class ConnectionManager:
         if call and call.get("started_at"):
             update["duration_seconds"] = int((update["ended_at"] - call["started_at"]).total_seconds())
         await calls_collection.update_one({"call_id": call_id}, {"$set": update})
+        await emit_event("call_dropped", call_id=call_id, disconnected_user_id=gone_user_id)
         await self.send_to_device(
             other_user_id, other_device_id,
             {"type": "call:ended", "call_id": call_id, "from": gone_user_id, "reason": "peer_disconnected"},
@@ -267,6 +278,7 @@ class ConnectionManager:
             {"call_id": call_id},
             {"$set": {"status": "NO_ANSWER", "end_reason": "NO_ANSWER", "ended_at": datetime.now(timezone.utc)}},
         )
+        await emit_event("call_no_answer", call_id=call_id, caller_id=caller_id, callee_id=callee_id, reason="timeout")
         await self.send_to_device(caller_id, caller_device_id, {"type": "call:timeout", "call_id": call_id})
         await self.send_to_all_devices(
             callee_id, {"type": "call:cancelled", "call_id": call_id, "from": caller_id, "reason": "timeout"}
@@ -369,6 +381,7 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
                 sender_id, sender_device_id,
                 {"type": "error", "message": "You don't have permission to start a call.", "code": "not_authorized_to_call"},
             )
+            await emit_event("permission_denied", user_id=sender_id, role=sender_role, code="not_authorized_to_call")
             return
 
         callee = await users_collection.find_one({"_id": ObjectId(callee_id)})
@@ -406,12 +419,14 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
                 sender_id, sender_device_id,
                 {"type": "error", "message": "You already have an active video call.", "code": "caller_busy"},
             )
+            await emit_event("caller_busy", user_id=sender_id, attempted_callee_id=callee_id)
             return
         if manager.find_active_call_for(callee_id):
             await manager.send_to_device(
                 sender_id, sender_device_id,
                 {"type": "error", "message": "Patient is already in an iLive call.", "code": "patient_busy"},
             )
+            await emit_event("patient_busy", user_id=sender_id, attempted_callee_id=callee_id)
             return
 
         call_id = str(uuid.uuid4())
@@ -445,9 +460,16 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
                 "permission_failures": 0,
                 "audio_only_fallback_occurred": False,
                 "qualifies_for_downstream_workflow": False,
+                # Epic §29 -- self-reported by the client in call:invite's
+                # optional "platform" field ("ios" | "android" | "web").
+                # Not trusted for anything security-relevant, purely
+                # informational for the audit trail.
+                "caller_platform": message.get("platform"),
+                "callee_platform": None,
                 "created_at": now,
             }
         )
+        await emit_event("call_initiated", call_id=call_id, caller_id=sender_id, callee_id=callee_id, caller_role=sender_role, media=media)
 
         # Ring every device the callee is connected on.
         delivered = await manager.send_to_all_devices(
@@ -466,6 +488,7 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
                 {"$set": {"status": "NO_ANSWER", "end_reason": "NO_ANSWER", "ended_at": datetime.now(timezone.utc)}},
             )
             await manager.send_to_device(sender_id, sender_device_id, {"type": "call:user-offline", "call_id": call_id})
+            await emit_event("call_no_answer", call_id=call_id, caller_id=sender_id, callee_id=callee_id, reason="offline")
             manager.call_participants.pop(call_id, None)
         else:
             # Nobody answered within RINGING_TIMEOUT_SECONDS -- auto-expire
@@ -498,6 +521,7 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
                     sender_id, sender_device_id,
                     {"type": "error", "message": "Patient consent is required before joining the call.", "code": "consent_required"},
                 )
+                await emit_event("consent_denied", call_id=call_id, user_id=sender_id)
                 return
             # First device to accept wins. Pin this device as the callee
             # for the rest of the call, and tell any other devices of this
@@ -512,10 +536,11 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
 
         manager._cancel_ringing_timer(call_id)
         now = datetime.now(timezone.utc)
-        await calls_collection.update_one(
-            {"call_id": call_id},
-            {"$set": {"status": "CONNECTED", "started_at": now, "answered_at": now, "consent_given": True, "consent_at": now}},
-        )
+        accept_update = {"status": "CONNECTED", "started_at": now, "answered_at": now, "consent_given": True, "consent_at": now}
+        if message.get("platform"):
+            accept_update["callee_platform"] = message["platform"]
+        await calls_collection.update_one({"call_id": call_id}, {"$set": accept_update})
+        await emit_event("call_connected", call_id=call_id, callee_id=sender_id)
         await manager.route(call_id, message["to"], {"type": "call:accepted", "call_id": call_id, "from": sender_id})
         return
 
@@ -525,6 +550,7 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             {"call_id": call_id},
             {"$set": {"status": "DECLINED", "end_reason": "PATIENT_DECLINED", "ended_at": datetime.now(timezone.utc)}},
         )
+        await emit_event("call_declined", call_id=call_id, user_id=sender_id)
         await manager.route(call_id, message["to"], {"type": "call:rejected", "call_id": call_id, "from": sender_id})
         manager.clear_call(call_id)
         return
@@ -535,6 +561,7 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             {"call_id": call_id},
             {"$set": {"status": "CANCELLED", "end_reason": "CALLER_CANCELLED", "ended_at": datetime.now(timezone.utc)}},
         )
+        await emit_event("call_cancelled", call_id=call_id, user_id=sender_id)
         # Not yet accepted (or already pinned, route() handles both) -- if
         # still pre-accept this correctly fans out to every device that was
         # ringing so they all stop.
@@ -560,14 +587,16 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             duration = (ended_at - call["started_at"]).total_seconds()
             update["duration_seconds"] = int(duration)
         await calls_collection.update_one({"call_id": call_id}, {"$set": update})
+        await emit_event("call_ended", call_id=call_id, user_id=sender_id, end_reason=end_reason)
         await manager.route(call_id, message["to"], {"type": "call:ended", "call_id": call_id, "from": sender_id})
         manager.clear_call(call_id)
         return
 
-    if msg_type in ("webrtc:offer", "webrtc:answer", "webrtc:ice-candidate", "call:media-switch"):
+    if msg_type in ("webrtc:offer", "webrtc:answer", "webrtc:ice-candidate", "call:media-switch", "call:network-quality"):
         # Relay untouched to the other peer's pinned device. call:media-switch
-        # is just an advance notice for the UI; the real change happens via
-        # the webrtc:offer/answer renegotiation the client sends alongside it.
+        # and call:network-quality are just advance notices for the UI; the
+        # real media change (if any) happens via the webrtc:offer/answer
+        # renegotiation the client sends alongside call:media-switch.
         call_id = message.get("call_id")
         if call_id not in manager.call_participants:
             # Stale/replayed message for a call that's already over --
@@ -579,6 +608,17 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             # so this is auditable, per the epic §21 requirement that
             # audio-only participation be distinctly logged.
             await calls_collection.update_one({"call_id": call_id}, {"$set": {"audio_only_fallback_occurred": True}})
+            await emit_event("audio_only_fallback", call_id=call_id, user_id=sender_id)
+        if msg_type == "call:network-quality" and message.get("quality"):
+            # Epic §23 -- persist the most recent self-reported quality
+            # bucket from each side, so it's visible in call history even
+            # after the call ends (not just live in the UI), and emit an
+            # analytics event for anyone tracking degraded-call rates.
+            await calls_collection.update_one(
+                {"call_id": call_id},
+                {"$set": {f"last_network_quality.{sender_id}": message["quality"]}},
+            )
+            await emit_event("network_quality_report", call_id=call_id, user_id=sender_id, quality=message["quality"])
         await manager.route(call_id, message["to"], {**message, "from": sender_id})
         return
 

@@ -4,6 +4,9 @@ export interface User {
   email: string;
   role: 'doctor' | 'patient';
   is_online: boolean;
+  // Epic §7 entry-point button states -- true if this user is currently
+  // ringing or connected on any call (see backend/app/routers/users.py).
+  in_active_call?: boolean;
 }
 
 export interface IceServer {
@@ -41,6 +44,7 @@ export type SignalingMessage =
   | { type: 'webrtc:answer'; call_id: string; from: string; sdp: any }
   | { type: 'webrtc:ice-candidate'; call_id: string; from: string; candidate: any }
   | { type: 'call:media-switch'; call_id: string; from: string; media: CallMedia }
+  | { type: 'call:network-quality'; call_id: string; from: string; quality: 'good' | 'fair' | 'poor' }
   | { type: 'presence:update'; user_id: string; is_online: boolean }
   | { type: 'error'; message: string; code?: string };
 

@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Depends
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.config import settings
-from app.database import calls_collection
+from app.database import analytics_events_collection, calls_collection
 from app.auth.dependencies import get_current_user
-from app.schemas.call import CallOut, IceServersResponse
+from app.schemas.call import CallOut, CallNotesUpdate, IceServersResponse, OUTCOMES
 
 router = APIRouter(prefix="/calls", tags=["calls"])
 
@@ -36,3 +38,62 @@ async def call_history(current_user: dict = Depends(get_current_user)):
         # literal None overriding the default and failing validation.
         calls.append(CallOut(**{k: c[k] for k in CallOut.model_fields if k in c}))
     return calls
+
+
+TERMINAL_STATUSES = {"DECLINED", "NO_ANSWER", "CANCELLED", "ENDED", "DROPPED"}
+
+
+@router.patch("/{call_id}/notes", response_model=CallOut)
+async def add_call_notes(call_id: str, body: CallNotesUpdate, current_user: dict = Depends(get_current_user)):
+    """
+    Epic §30: post-call notes & outcome. Only the two participants on the
+    call can add notes, and only once the call has actually ended -- notes
+    on a still-ringing/connected call don't make sense and would race with
+    the signaling layer's own writes to the same document.
+    """
+    user_id = str(current_user["_id"])
+    call = await calls_collection.find_one({"call_id": call_id})
+    if not call:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found")
+    if user_id not in (call.get("caller_id"), call.get("callee_id")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You weren't a participant on this call")
+    if call.get("status") not in TERMINAL_STATUSES:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Notes can only be added after the call has ended")
+    if body.outcome is not None and body.outcome not in OUTCOMES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"outcome must be one of {sorted(OUTCOMES)}")
+
+    update = {
+        "notes": body.notes,
+        "outcome": body.outcome,
+        "follow_up_required": body.follow_up_required,
+        "notes_added_at": datetime.now(timezone.utc),
+        "notes_added_by": user_id,
+    }
+    await calls_collection.update_one({"call_id": call_id}, {"$set": update})
+    call.update(update)
+    return CallOut(**{k: call[k] for k in CallOut.model_fields if k in call})
+
+
+@router.get("/{call_id}/events")
+async def get_call_events(call_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Epic §36: queryable analytics events for a single call (call_initiated,
+    call_connected, permission_denied, ...), emitted by
+    app.analytics.emit_event at each lifecycle transition. Scoped to
+    participants only -- there's no admin/operator role in this build yet,
+    so this is the privacy-safe subset: you can see the event trail for
+    calls you were actually on.
+    """
+    call = await calls_collection.find_one({"call_id": call_id})
+    if not call:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found")
+    user_id = str(current_user["_id"])
+    if user_id not in (call.get("caller_id"), call.get("callee_id")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You weren't a participant on this call")
+
+    events = []
+    cursor = analytics_events_collection.find({"call_id": call_id}).sort("timestamp", 1)
+    async for e in cursor:
+        e["_id"] = str(e["_id"])
+        events.append(e)
+    return events

@@ -21,6 +21,14 @@ class UserOut(BaseModel):
     email: EmailStr
     role: str
     is_online: bool = False
+    # Epic §7 entry-point button states -- lets the caller's UI show
+    # "Patient Busy" proactively (before even attempting call:invite,
+    # which would otherwise be the first time they learn this) rather
+    # than only finding out after the invite is rejected. Computed from
+    # calls_collection, not the live in-memory call_participants map
+    # (that only exists inside the signaling module) -- see
+    # routers/users.py's list_users.
+    in_active_call: bool = False
 
 
 class TokenResponse(BaseModel):

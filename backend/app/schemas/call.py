@@ -6,6 +6,27 @@ class CallInitiate(BaseModel):
     callee_id: str
 
 
+# Epic §30's post-call outcome options. Free-text notes are also allowed
+# alongside this (see CallOut.notes) since real clinical outcomes rarely
+# fit a fixed enum perfectly -- this list is a reasonable default covering
+# the common cases, not a value verified against the epic's own schema
+# (that level of detail needs Medical sign-off, same as the other open
+# decisions in the gap-analysis doc's §40 section).
+OUTCOMES = (
+    "RESOLVED",
+    "FOLLOW_UP_REQUIRED",
+    "REFERRED",
+    "ESCALATED",
+    "NO_CLINICAL_ACTION",
+)
+
+
+class CallNotesUpdate(BaseModel):
+    notes: str | None = None
+    outcome: str | None = None  # one of OUTCOMES, if set
+    follow_up_required: bool = False
+
+
 # Epic §29's End Reasons enum. Only the ones this backend can actually
 # determine are set for real; the rest exist so downstream consumers (audit
 # reports, analytics) have a stable set of values to expect even before
@@ -90,6 +111,22 @@ class CallOut(BaseModel):
     # workflow exists yet, so this is always false today -- a placeholder,
     # not a real determination.
     qualifies_for_downstream_workflow: bool = False
+
+    # Post-call notes & outcome (epic §30). Settable once via PATCH
+    # /calls/{call_id}/notes by either participant, after the call has
+    # ended -- see routers/calls.py.
+    notes: str | None = None
+    outcome: str | None = None
+    follow_up_required: bool = False
+    notes_added_at: datetime | None = None
+    notes_added_by: str | None = None
+
+    # Epic §23 network-quality indicator -- most recent self-reported
+    # quality bucket ("good"/"fair"/"poor") from each side, keyed by
+    # user_id. Live updates happen over the call:network-quality
+    # signaling message (see ws_manager.py); this is just the
+    # last-known-value snapshot for call history / post-call review.
+    last_network_quality: dict[str, str] = {}
 
 
 class IceServersResponse(BaseModel):
