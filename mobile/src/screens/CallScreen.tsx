@@ -20,9 +20,12 @@ export default function CallScreen() {
     isMuted,
     isVideoOn,
     isRemoteVideoOn,
+    isSpeakerOn,
     networkQuality,
     endCall,
     toggleMute,
+    toggleSpeaker,
+    flipCamera,
     switchToVideo,
     switchToVoice,
   } = useCall();
@@ -62,6 +65,9 @@ export default function CallScreen() {
         <TouchableOpacity style={styles.controlButton} onPress={toggleMute}>
           <Text style={styles.controlIcon}>{isMuted ? 'Unmute' : 'Mute'}</Text>
         </TouchableOpacity>
+        <TouchableOpacity style={styles.controlButton} onPress={toggleSpeaker}>
+          <Text style={styles.controlIcon}>{isSpeakerOn ? 'Speaker' : 'Earpiece'}</Text>
+        </TouchableOpacity>
         <TouchableOpacity style={[styles.controlButton, styles.endCall]} onPress={endCall}>
           <Text style={styles.controlIcon}>End</Text>
         </TouchableOpacity>
@@ -78,6 +84,11 @@ export default function CallScreen() {
         >
           <Text style={styles.controlIcon}>{isVideoOn ? 'Switch to voice' : 'Switch to video'}</Text>
         </TouchableOpacity>
+        {isVideoOn && (
+          <TouchableOpacity style={styles.controlButton} onPress={flipCamera}>
+            <Text style={styles.controlIcon}>Flip camera</Text>
+          </TouchableOpacity>
+        )}
       </View>
     </View>
   );
@@ -114,15 +125,17 @@ const styles = StyleSheet.create({
   controls: {
     position: 'absolute',
     bottom: 48,
-    left: 0,
-    right: 0,
+    left: 12,
+    right: 12,
     flexDirection: 'row',
-    justifyContent: 'space-evenly',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: 10,
   },
   controlButton: {
     backgroundColor: 'rgba(255,255,255,0.15)',
-    paddingHorizontal: 18,
-    paddingVertical: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
     borderRadius: 30,
   },
   endCall: { backgroundColor: '#dc2626' },

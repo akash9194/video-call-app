@@ -185,6 +185,7 @@
     <button class="ctrl-btn" onclick="toggleMute()" id="mute-btn">Mute</button>
     <button class="ctrl-btn danger" style="border-radius:30px" onclick="endCall()">End</button>
     <button class="ctrl-btn" onclick="handleSwitchClick()" id="switch-btn">Switch to video</button>
+    <button class="ctrl-btn" onclick="flipCamera()" id="flip-camera-btn" style="display:none">Flip camera</button>
   </div>
 </div>
 
@@ -217,6 +218,11 @@ let audioOnlyAutoFallbackEnabled = false;
 // every call. lastAudioStats/lastReportedQuality avoid re-sending the
 // same bucket to the peer on every 5s tick.
 let lastAudioStats = null, lastReportedQuality = null;
+// Epic §22 front/rear camera switch -- which physical camera the local
+// video track is currently using. Toggled by flipCamera(); irrelevant on
+// desktop browsers with one camera (getUserMedia will just fail to find
+// the other facingMode, handled gracefully below).
+let currentFacingMode = 'user';
 
 // A stable per-browser device_id, persisted across reloads, is what lets a
 // dropped WebSocket reconnect as the SAME device server-side (see
@@ -471,6 +477,7 @@ async function handleSignal(msg) {
       callId = msg.call_id;
       callingTargetId = null; // no longer "Calling..." -- selfBusy (callId !== null) takes over as "Call in Progress"
       refreshUserListButtons();
+      stopRingingTimer();
       document.getElementById('call-status').textContent = 'Connecting...';
       await setupPeerConnection(initialMedia === 'video');
       const offer = await pc.createOffer();
@@ -599,14 +606,38 @@ function showToast(text) {
 }
 
 // ---- call actions ----
+let ringingTimer = null, ringingStartedAt = null;
+
+// Epic §10 ringing-duration timer -- shows how long we've been waiting for
+// an answer, so "Calling..." doesn't sit there indefinitely with no sense
+// of elapsed time. Stops the moment the call connects, is cancelled, or
+// times out (i.e. the moment call-status stops meaning "still ringing").
+function startRingingTimer() {
+  stopRingingTimer();
+  ringingStartedAt = Date.now();
+  const tick = () => {
+    const elapsed = Math.floor((Date.now() - ringingStartedAt) / 1000);
+    const mm = Math.floor(elapsed / 60);
+    const ss = String(elapsed % 60).padStart(2, '0');
+    document.getElementById('call-status').textContent = `Calling... ${mm}:${ss}`;
+  };
+  tick();
+  ringingTimer = setInterval(tick, 1000);
+}
+function stopRingingTimer() {
+  if (ringingTimer) clearInterval(ringingTimer);
+  ringingTimer = null;
+  ringingStartedAt = null;
+}
+
 async function placeCall(id, name, media) {
   callId = null; otherId = id; otherName = name;
   callingTargetId = id;
   initialMedia = media === 'audio' ? 'audio' : 'video';
   send({ type: 'call:invite', to: id, media: initialMedia, platform: 'web' });
   document.getElementById('call-peer-name').textContent = name;
-  document.getElementById('call-status').textContent = 'Calling...';
   document.getElementById('call-screen').style.display = 'block';
+  startRingingTimer();
   isVideoOn = false; isRemoteVideoOn = false;
   updateLocalVideoVisibility(); updateRemoteVideoVisibility(); updateSwitchButton();
   refreshUserListButtons();
@@ -785,6 +816,7 @@ function updateRemoteVideoVisibility() {
 
 function updateSwitchButton() {
   document.getElementById('switch-btn').textContent = isVideoOn ? 'Switch to voice' : 'Switch to video';
+  document.getElementById('flip-camera-btn').style.display = isVideoOn ? 'inline-block' : 'none';
 }
 
 function handleSwitchClick() {
@@ -837,8 +869,37 @@ function switchToVoice(auto) {
   send({ type: 'call:media-switch', call_id: callId, to: otherId, media: 'audio', ...(auto ? { auto: true } : {}) });
 }
 
+// Epic §22 front/rear camera switch. Uses replaceTrack() on the existing
+// RTCRtpSender rather than removing/re-adding a track -- same media kind,
+// so no renegotiation or call:media-switch notice is needed; the remote
+// side just sees the picture change, exactly like a real phone's camera
+// flip button.
+async function flipCamera() {
+  if (!pc || !localStream || !isVideoOn) return;
+  const nextFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: nextFacingMode } });
+    const newTrack = newStream.getVideoTracks()[0];
+    if (!newTrack) return;
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (sender) await sender.replaceTrack(newTrack);
+    const oldTrack = localStream.getVideoTracks()[0];
+    if (oldTrack) { localStream.removeTrack(oldTrack); oldTrack.stop(); }
+    localStream.addTrack(newTrack);
+    document.getElementById('local-video').srcObject = localStream;
+    currentFacingMode = nextFacingMode;
+  } catch (e) {
+    // Most common cause on a laptop/desktop: there's only one camera, so
+    // the opposite facingMode doesn't exist. Not an error worth alarming
+    // the user over -- just leave the current camera running.
+    console.warn('[camera] flipCamera failed (likely only one camera available):', e);
+    showToast('Only one camera available on this device.');
+  }
+}
+
 function cleanupCall() {
   stopStatsMonitor();
+  stopRingingTimer();
   document.getElementById('incoming-modal').style.display = 'none';
   document.getElementById('call-screen').style.display = 'none';
   if (pc) { pc.close(); pc = null; }
@@ -852,6 +913,7 @@ function cleanupCall() {
   if (callId) openNotesModal(callId);
   callId = null; otherId = null; otherName = null;
   callingTargetId = null;
+  currentFacingMode = 'user';
   isMuted = false; isVideoOn = false; isRemoteVideoOn = false;
   document.getElementById('mute-btn').textContent = 'Mute';
   updateSwitchButton();

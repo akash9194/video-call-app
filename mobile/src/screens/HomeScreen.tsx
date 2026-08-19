@@ -8,7 +8,7 @@ import { NavProp } from '../navigation';
 
 export default function HomeScreen({ navigation }: { navigation: NavProp }) {
   const { user, logout } = useAuth();
-  const { status, remoteUserId, startCall } = useCall();
+  const { status, remoteUserId, callingElapsedSeconds, startCall } = useCall();
   const [users, setUsers] = useState<User[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [refreshing, setRefreshing] = useState(false);
@@ -67,7 +67,11 @@ export default function HomeScreen({ navigation }: { navigation: NavProp }) {
           let buttonState: { label: string; disabled: true } | null = null;
           if (canCallThisUser) {
             if (status === 'calling' && remoteUserId === item.id) {
-              buttonState = { label: 'Calling…', disabled: true };
+              // §10 ringing-duration timer, shown right in the button
+              // since there's no dedicated "Calling..." screen on mobile.
+              const mm = Math.floor(callingElapsedSeconds / 60);
+              const ss = String(callingElapsedSeconds % 60).padStart(2, '0');
+              buttonState = { label: `Calling… ${mm}:${ss}`, disabled: true };
             } else if (selfBusy) {
               buttonState = { label: 'Call in Progress', disabled: true };
             } else if (!item.is_online) {

@@ -5,7 +5,7 @@ import { MediaStream } from 'react-native-webrtc';
 
 import { signalingClient } from '../services/signaling';
 import { api } from '../services/api';
-import { createPeerConnection, getLocalStream, RTCIceCandidate, RTCSessionDescription } from '../services/webrtc';
+import { createPeerConnection, getLocalStream, switchCamera, RTCIceCandidate, RTCSessionDescription } from '../services/webrtc';
 import { bucketNetworkQuality, NetworkQuality } from '../services/networkQuality';
 import { CallStatus, CallMedia, SignalingMessage } from '../types';
 import { navigate } from '../navigation';
@@ -21,12 +21,16 @@ interface CallContextValue {
   isMuted: boolean;
   isVideoOn: boolean; // do we currently have a live local video track in this call?
   isRemoteVideoOn: boolean; // is the OTHER side currently sending video?
+  isSpeakerOn: boolean; // epic §22 -- speaker vs earpiece routing
   networkQuality: NetworkQuality | null; // epic §23 -- our own outbound-facing view of the call's quality
+  callingElapsedSeconds: number; // epic §10 -- seconds spent ringing so far (0 unless status === 'calling')
   startCall: (calleeId: string, calleeName: string, media: CallMedia) => Promise<void>;
   acceptCall: (consent: boolean) => Promise<void>;
   rejectCall: () => void;
   endCall: () => void;
   toggleMute: () => void;
+  toggleSpeaker: () => void;
+  flipCamera: () => void;
   switchToVideo: () => Promise<void>;
   switchToVoice: (auto?: boolean) => void;
 }
@@ -47,6 +51,16 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOn, setIsVideoOn] = useState(false);
   const [isRemoteVideoOn, setIsRemoteVideoOn] = useState(false);
+  // Epic §22 -- speaker/earpiece routing. Defaults to speaker-on for video
+  // calls (holding a phone to your ear while looking at video makes no
+  // sense) and speaker-off (earpiece) for audio calls, same convention as
+  // every phone dialer. InCallManager.start({media}) already nudges the OS
+  // this way, but doesn't expose a way to read the state back or let the
+  // user override it -- this state + toggle is that explicit control.
+  const [isSpeakerOn, setIsSpeakerOn] = useState(false);
+  // Epic §10 ringing-duration timer -- seconds elapsed since we started
+  // ringing (status === 'calling'), reset once we leave that state.
+  const [callingElapsedSeconds, setCallingElapsedSeconds] = useState(0);
 
   const pcRef = useRef<any>(null);
   // How THIS call started ('audio' or 'video') -- set by startCall (caller)
@@ -77,6 +91,22 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => { callIdRef.current = callId; }, [callId]);
   useEffect(() => { remoteUserIdRef.current = remoteUserId; }, [remoteUserId]);
   useEffect(() => { isVideoOnRef.current = isVideoOn; }, [isVideoOn]);
+
+  // Epic §10 ringing-duration timer. Ticks only while we're the caller
+  // waiting for an answer; resets to 0 the instant we leave that state
+  // (accepted, declined, timed out, cancelled -- doesn't matter which).
+  useEffect(() => {
+    if (status !== 'calling') {
+      setCallingElapsedSeconds(0);
+      return;
+    }
+    setCallingElapsedSeconds(0);
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      setCallingElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [status]);
 
   const stopStatsMonitor = () => {
     if (statsTimerRef.current) clearInterval(statsTimerRef.current);
@@ -180,6 +210,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     setIsMuted(false);
     setIsVideoOn(false);
     setIsRemoteVideoOn(false);
+    setIsSpeakerOn(false);
     InCallManager.stop();
   };
 
@@ -238,6 +269,10 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     if (!consent) return;
     setStatus('connecting');
     InCallManager.start({ media: 'video' });
+    // Epic §22 default: speaker for video, earpiece for audio-only.
+    const defaultSpeaker = initialMediaRef.current === 'video';
+    InCallManager.setSpeakerphoneOn(defaultSpeaker);
+    setIsSpeakerOn(defaultSpeaker);
     await setupPeerConnection(remoteUserId, callId, initialMediaRef.current);
     signalingClient.send({ type: 'call:accept', call_id: callId, to: remoteUserId, consent: true, platform: Platform.OS });
     // Offer will arrive from the caller next; we answer it in the message handler.
@@ -260,6 +295,21 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   const toggleMute = () => {
     localStream?.getAudioTracks().forEach((t: any) => (t.enabled = isMuted));
     setIsMuted(!isMuted);
+  };
+
+  const toggleSpeaker = () => {
+    const next = !isSpeakerOn;
+    InCallManager.setSpeakerphoneOn(next);
+    setIsSpeakerOn(next);
+  };
+
+  // Epic §22 front/rear camera flip. Only meaningful while a live local
+  // video track exists -- no-ops (returns false, logged) on an audio-only
+  // call, same guard the underlying _switchCamera() itself enforces.
+  const flipCamera = () => {
+    if (!switchCamera(localStream)) {
+      console.warn('[call] flipCamera: no live video track to switch');
+    }
   };
 
   // Switching video on/off mid-call. If a local video track already
@@ -349,6 +399,10 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           setCallId(acceptedCallId);
           InCallManager.stopRingtone();
           InCallManager.start({ media: 'video' });
+          // Epic §22 default: speaker for video, earpiece for audio-only.
+          const defaultSpeaker = initialMediaRef.current === 'video';
+          InCallManager.setSpeakerphoneOn(defaultSpeaker);
+          setIsSpeakerOn(defaultSpeaker);
           setStatus('connecting');
           const pc = await setupPeerConnection(remoteUserId, acceptedCallId, initialMediaRef.current);
           const offer = await pc.createOffer({});
@@ -558,12 +612,16 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         isMuted,
         isVideoOn,
         isRemoteVideoOn,
+        isSpeakerOn,
         networkQuality,
+        callingElapsedSeconds,
         startCall,
         acceptCall,
         rejectCall,
         endCall,
         toggleMute,
+        toggleSpeaker,
+        flipCamera,
         switchToVideo,
         switchToVoice,
       }}
