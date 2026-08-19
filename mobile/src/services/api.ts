@@ -61,6 +61,15 @@ export const api = {
     return data.ice_servers as IceServer[];
   },
 
+  // Same endpoint as getIceServers, but also surfaces the epic-§21 flag
+  // that gates the automatic audio-only fallback loop. Kept as a separate
+  // method (rather than changing getIceServers' return shape) so existing
+  // call sites that only want the ICE list don't need to change.
+  async getIceServersConfig() {
+    const data = await request('/calls/ice-servers');
+    return data as { ice_servers: IceServer[]; audio_only_auto_fallback_enabled: boolean };
+  },
+
   async callHistory() {
     return request('/calls/history');
   },

@@ -5,6 +5,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.auth.dependencies import get_current_user
+from app.config import settings
 from app.database import appointments_collection, users_collection
 from app.schemas.appointment import AppointmentCreate, AppointmentOut, AppointmentStatusUpdate
 
@@ -15,12 +16,20 @@ router = APIRouter(prefix="/appointments", tags=["appointments"])
 # checks for a "scheduled" appointment between the two before letting a
 # call ring). This router only covers creating/listing/closing them --
 # scheduling UI/calendar features are out of scope here.
+#
+# Known limitation: list_appointments below still assumes exactly two
+# roles (doctor/patient) to decide which side of the record a user is on.
+# That's fine while "doctor" is the only VIDEO_CALL_INITIATE-permitted
+# role, but won't generalize if the role list grows (epic §6). Flagged
+# rather than fixed here since the appointment model itself is a
+# placeholder pending the tenant/assignment eligibility redesign (see the
+# gap-analysis doc).
 
 
 @router.post("", response_model=AppointmentOut, status_code=status.HTTP_201_CREATED)
 async def create_appointment(body: AppointmentCreate, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != "doctor":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only doctors can create appointments")
+    if not settings.has_permission(current_user["role"], "VIDEO_CALL_INITIATE"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have permission to schedule calls")
 
     patient = await users_collection.find_one({"_id": ObjectId(body.patient_id)})
     if not patient or patient["role"] != "patient":

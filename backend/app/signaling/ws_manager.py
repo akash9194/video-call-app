@@ -19,7 +19,7 @@ Protocol (all messages are JSON with a "type" field):
     webrtc:offer        { call_id, to: userId, sdp }
     webrtc:answer       { call_id, to: userId, sdp }
     webrtc:ice-candidate{ call_id, to: userId, candidate }
-    call:media-switch   { call_id, to: userId, media: "audio" | "video" }
+    call:media-switch   { call_id, to: userId, media: "audio" | "video", auto?: true }
 
   Server -> Client
     call:incoming          { call_id, from: userId, from_name, media: "audio" | "video" }
@@ -37,18 +37,22 @@ Protocol (all messages are JSON with a "type" field):
     presence:update         { user_id, is_online }
     error                   { message, code }
 
-Doctor-only initiation
------------------------
-Only a "doctor"-role user can send call:invite; a "patient"-role user
-never can. This is enforced here in the server, not just by hiding the UI
-button on the client, since a client is never trusted input. A doctor also
-needs an active ("scheduled") appointment with the specific patient they're
-calling -- see appointments_collection / app/routers/appointments.py. A
-rejected call:invite never creates a call_id and gets a targeted `error`
-back with a `code` the client can key off of:
-    not_authorized_to_call  -- sender isn't a doctor
+Role-based call initiation
+----------------------------
+Only a user whose role holds the VIDEO_CALL_INITIATE permission (see
+Settings.has_permission / video_call_initiate_roles -- "doctor" by default,
+configurable via env, not a hardcoded string comparison) can send
+call:invite; anyone else never can. This is enforced here in the server,
+not just by hiding the UI button on the client, since a client is never
+trusted input. The initiator also needs an active ("scheduled") appointment
+with the specific patient they're calling -- see appointments_collection /
+app/routers/appointments.py. A rejected call:invite never creates a call_id
+and gets a targeted `error` back with a `code` the client can key off of:
+    not_authorized_to_call  -- sender's role lacks VIDEO_CALL_INITIATE
     invalid_callee           -- target isn't a patient (or doesn't exist)
     no_active_appointment    -- no scheduled appointment links the two
+    caller_busy               -- sender already has another call in progress
+    patient_busy               -- callee already has another call in progress
 
 Patient consent
 -----------------
@@ -56,8 +60,10 @@ The callee (always the patient) must send `consent: true` on call:accept
 for it to be honored -- this is the server-side gate behind the client's
 consent step before a telehealth session connects. A missing/false consent
 gets a targeted error back with code `consent_required` and the call stays
-ringing so the client can show the consent step and retry. On a successful
-accept, `consent_given`/`consent_at` are stamped onto the call record.
+ringing so the client can show the consent step and retry (each rejected
+attempt increments the call record's permission_failures counter). On a
+successful accept, `consent_given`/`consent_at` are stamped onto the call
+record.
 
 Switching between voice and video mid-call is NOT a new call -- it's a
 WebRTC renegotiation on the *existing* peer connection: the side that's
@@ -67,7 +73,10 @@ messages above, sent again on an already-active call_id). call:media-switch
 is purely an advance notice so the other side's UI can react immediately
 (e.g. swap to an avatar) without waiting on the renegotiation round-trip;
 this server does not need to understand or validate it, only relay it, the
-same as it does for the webrtc:* messages.
+same as it does for the webrtc:* messages -- except for one thing: if it
+carries `auto: true` (the client's automatic audio-only fallback, distinct
+from the user manually tapping "switch to voice"), the call record is
+tagged audio_only_fallback_occurred so that's auditable later.
 
 Multi-device behaviour
 -----------------------
@@ -82,6 +91,15 @@ they can dismiss their incoming-call screen. From that point on, every
 message for that call_id (webrtc:*, call:media-switch, call:end, ...) is
 routed only to the two pinned devices, never fanned out.
 
+Single-active-call locking
+-----------------------------
+Before a call_id is created, both sides are checked against
+`call_participants` (the live, in-memory source of truth for what's
+currently ringing or connected) -- if the caller is already a party to
+another call, or the callee is, the invite is rejected with caller_busy /
+patient_busy respectively rather than creating a second overlapping
+session for either of them.
+
 Stale/replayed messages
 -------------------------
 call:accept and every webrtc:*/call:media-switch message are only honored
@@ -95,14 +113,22 @@ Ringing timeout & disconnect grace period
 -------------------------------------------
 A call left ringing for RINGING_TIMEOUT_SECONDS with nobody accepting is
 auto-expired: the caller gets call:timeout, the callee's devices get
-call:cancelled, and the call is marked "missed". Once a call is active, if
-one side's WebSocket connection drops (wifi hiccup, app backgrounded), the
-call is NOT ended immediately -- the other side gets call:peer-disconnected
-and the call stays pinned for DISCONNECT_GRACE_SECONDS so a reconnecting
-client (see signaling.ts's auto-reconnect, which reuses the same stable
-device_id) can resume it; call:peer-reconnected fires if they make it back
-in time, otherwise the call is cleanly ended with reason "peer_disconnected"
-instead of hanging forever on both sides.
+call:cancelled, and the call is marked NO_ANSWER. Once a call is connected,
+if one side's WebSocket connection drops (wifi hiccup, app backgrounded),
+the call is NOT ended immediately -- the other side gets
+call:peer-disconnected (and the call record's interruption_count is
+incremented) and the call stays pinned for DISCONNECT_GRACE_SECONDS so a
+reconnecting client (see signaling.ts's auto-reconnect, which reuses the
+same stable device_id) can resume it; call:peer-reconnected fires if they
+make it back in time (reconnection_count incremented), otherwise the call
+is cleanly ended as DROPPED instead of hanging forever on both sides.
+
+Call-state vocabulary
+------------------------
+Persisted call.status values: RINGING, CONNECTED, DECLINED, NO_ANSWER,
+CANCELLED, ENDED, DROPPED (BUSY is rejected before a call record is ever
+created, so it never appears as a status). Every terminal transition also
+stamps an `end_reason` from schemas.call.END_REASONS.
 """
 
 import asyncio
@@ -114,6 +140,7 @@ from datetime import datetime, timezone
 from fastapi import WebSocket
 from bson import ObjectId
 
+from app.config import settings
 from app.database import appointments_collection, calls_collection, users_collection
 
 logger = logging.getLogger(__name__)
@@ -153,6 +180,7 @@ class ConnectionManager:
             if not mine:
                 continue
             self._cancel_disconnect_timer(call_id)
+            await calls_collection.update_one({"call_id": call_id}, {"$inc": {"reconnection_count": 1}})
             await self.send_to_device(other[0], other[1], {"type": "call:peer-reconnected", "call_id": call_id})
 
     async def disconnect(self, user_id: str, device_id: str):
@@ -176,6 +204,7 @@ class ConnectionManager:
             mine, other = self._match_participant(participants, user_id, device_id)
             if not mine:
                 continue
+            await calls_collection.update_one({"call_id": call_id}, {"$inc": {"interruption_count": 1}})
             await self.send_to_device(other[0], other[1], {"type": "call:peer-disconnected", "call_id": call_id})
             self._cancel_disconnect_timer(call_id)
             self.disconnect_timers[call_id] = asyncio.create_task(
@@ -195,6 +224,17 @@ class ConnectionManager:
             return callee, caller
         return None, None
 
+    def find_active_call_for(self, user_id: str) -> str | None:
+        """The call_id `user_id` is currently ringing or connected on
+        (as either caller or callee), if any -- used for single-active-call
+        locking (epic §19) before a new call_id is created."""
+        for call_id, participants in self.call_participants.items():
+            caller = participants.get("caller")
+            callee = participants.get("callee")
+            if (caller and caller[0] == user_id) or (callee and callee[0] == user_id):
+                return call_id
+        return None
+
     async def _expire_disconnected_call(self, call_id, gone_user_id, gone_device_id, other_user_id, other_device_id):
         try:
             await asyncio.sleep(DISCONNECT_GRACE_SECONDS)
@@ -204,7 +244,7 @@ class ConnectionManager:
         if not still_gone:
             return  # reconnected in time -- connect() already notified the peer
         call = await calls_collection.find_one({"call_id": call_id})
-        update = {"status": "ended", "ended_at": datetime.now(timezone.utc)}
+        update = {"status": "DROPPED", "end_reason": "NETWORK_FAILURE", "ended_at": datetime.now(timezone.utc)}
         if call and call.get("started_at"):
             update["duration_seconds"] = int((update["ended_at"] - call["started_at"]).total_seconds())
         await calls_collection.update_one({"call_id": call_id}, {"$set": update})
@@ -225,7 +265,7 @@ class ConnectionManager:
             return  # already accepted/resolved by some other path
         await calls_collection.update_one(
             {"call_id": call_id},
-            {"$set": {"status": "missed", "ended_at": datetime.now(timezone.utc)}},
+            {"$set": {"status": "NO_ANSWER", "end_reason": "NO_ANSWER", "ended_at": datetime.now(timezone.utc)}},
         )
         await self.send_to_device(caller_id, caller_device_id, {"type": "call:timeout", "call_id": call_id})
         await self.send_to_all_devices(
@@ -318,16 +358,16 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
         if media not in ("audio", "video"):
             media = "video"
 
-        # -- Doctor-only initiation -----------------------------------
-        # This is enforced here, server-side, deliberately -- a patient's
-        # client can't be trusted to just hide the "call" button, since
-        # nothing stops a modified/malicious client from sending this
-        # message directly. Reject anything that isn't a doctor calling a
-        # patient before a call_id is even created.
-        if sender_role != "doctor":
+        # -- Role-based initiation ---------------------------------------
+        # This is enforced here, server-side, deliberately -- a client
+        # can't be trusted to just hide the "call" button, since nothing
+        # stops a modified/malicious client from sending this message
+        # directly. Reject anything sent by a role without
+        # VIDEO_CALL_INITIATE before a call_id is even created.
+        if not settings.has_permission(sender_role, "VIDEO_CALL_INITIATE"):
             await manager.send_to_device(
                 sender_id, sender_device_id,
-                {"type": "error", "message": "Only a doctor can start a call.", "code": "not_authorized_to_call"},
+                {"type": "error", "message": "You don't have permission to start a call.", "code": "not_authorized_to_call"},
             )
             return
 
@@ -340,9 +380,12 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             return
 
         # -- Appointment linkage ---------------------------------------
-        # A doctor can only ring a patient they have an active (not
+        # The initiator can only ring a patient they have an active (not
         # completed/cancelled) appointment with -- prevents unrelated or
-        # accidental doctor -> patient contact.
+        # accidental contact. (Epic §6 replaces this with a broader
+        # role/tenant/assignment eligibility model; appointments remain the
+        # eligibility signal here pending that product decision -- see the
+        # gap-analysis doc.)
         appointment = await appointments_collection.find_one(
             {"doctor_id": sender_id, "patient_id": callee_id, "status": "scheduled"}
         )
@@ -353,6 +396,24 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             )
             return
 
+        # -- Single-active-call locking (epic §19) ------------------------
+        # Enforced against call_participants -- the live, authoritative
+        # record of who's currently ringing or connected -- not just the
+        # UI. Checked caller-first so a caller who's themselves busy gets
+        # that specific reason rather than a generic failure.
+        if manager.find_active_call_for(sender_id):
+            await manager.send_to_device(
+                sender_id, sender_device_id,
+                {"type": "error", "message": "You already have an active video call.", "code": "caller_busy"},
+            )
+            return
+        if manager.find_active_call_for(callee_id):
+            await manager.send_to_device(
+                sender_id, sender_device_id,
+                {"type": "error", "message": "Patient is already in an iLive call.", "code": "patient_busy"},
+            )
+            return
+
         call_id = str(uuid.uuid4())
 
         # Pin the caller's device now -- everything for this call_id that's
@@ -360,19 +421,31 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
         # land on this specific device, not fan out to their other devices.
         manager.call_participants[call_id] = {"caller": (sender_id, sender_device_id), "callee": None}
 
+        now = datetime.now(timezone.utc)
         await calls_collection.insert_one(
             {
                 "call_id": call_id,
                 "caller_id": sender_id,
                 "callee_id": callee_id,
+                "caller_role": sender_role,
+                "tenant_id": "default",
                 "media": media,
-                "status": "ringing",
+                "status": "RINGING",
+                "end_reason": None,
+                "initiated_at": now,
+                "ringing_at": now,
+                "answered_at": None,
                 "started_at": None,
                 "ended_at": None,
                 "duration_seconds": None,
                 "consent_given": False,
                 "consent_at": None,
-                "created_at": datetime.now(timezone.utc),
+                "interruption_count": 0,
+                "reconnection_count": 0,
+                "permission_failures": 0,
+                "audio_only_fallback_occurred": False,
+                "qualifies_for_downstream_workflow": False,
+                "created_at": now,
             }
         )
 
@@ -388,7 +461,10 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             },
         )
         if not delivered:
-            await calls_collection.update_one({"call_id": call_id}, {"$set": {"status": "missed"}})
+            await calls_collection.update_one(
+                {"call_id": call_id},
+                {"$set": {"status": "NO_ANSWER", "end_reason": "NO_ANSWER", "ended_at": datetime.now(timezone.utc)}},
+            )
             await manager.send_to_device(sender_id, sender_device_id, {"type": "call:user-offline", "call_id": call_id})
             manager.call_participants.pop(call_id, None)
         else:
@@ -410,12 +486,14 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
 
         if participants.get("callee") is None:
             # -- Patient consent gate ---------------------------------
-            # The callee here is always the patient (only doctors can
-            # invite). Require explicit consent before pinning this device
-            # as the callee or marking the call active -- enforced here,
-            # not just by a client-side modal, same reasoning as
-            # doctor-only initiation above: a client can't be trusted.
+            # The callee here is always the patient (only a
+            # VIDEO_CALL_INITIATE-permitted role can invite). Require
+            # explicit consent before pinning this device as the callee or
+            # marking the call connected -- enforced here, not just by a
+            # client-side modal, same reasoning as role-based initiation
+            # above: a client can't be trusted.
             if not message.get("consent"):
+                await calls_collection.update_one({"call_id": call_id}, {"$inc": {"permission_failures": 1}})
                 await manager.send_to_device(
                     sender_id, sender_device_id,
                     {"type": "error", "message": "Patient consent is required before joining the call.", "code": "consent_required"},
@@ -436,21 +514,27 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
         now = datetime.now(timezone.utc)
         await calls_collection.update_one(
             {"call_id": call_id},
-            {"$set": {"status": "active", "started_at": now, "consent_given": True, "consent_at": now}},
+            {"$set": {"status": "CONNECTED", "started_at": now, "answered_at": now, "consent_given": True, "consent_at": now}},
         )
         await manager.route(call_id, message["to"], {"type": "call:accepted", "call_id": call_id, "from": sender_id})
         return
 
     if msg_type == "call:reject":
         call_id = message["call_id"]
-        await calls_collection.update_one({"call_id": call_id}, {"$set": {"status": "rejected"}})
+        await calls_collection.update_one(
+            {"call_id": call_id},
+            {"$set": {"status": "DECLINED", "end_reason": "PATIENT_DECLINED", "ended_at": datetime.now(timezone.utc)}},
+        )
         await manager.route(call_id, message["to"], {"type": "call:rejected", "call_id": call_id, "from": sender_id})
         manager.clear_call(call_id)
         return
 
     if msg_type == "call:cancel":
         call_id = message["call_id"]
-        await calls_collection.update_one({"call_id": call_id}, {"$set": {"status": "cancelled"}})
+        await calls_collection.update_one(
+            {"call_id": call_id},
+            {"$set": {"status": "CANCELLED", "end_reason": "CALLER_CANCELLED", "ended_at": datetime.now(timezone.utc)}},
+        )
         # Not yet accepted (or already pinned, route() handles both) -- if
         # still pre-accept this correctly fans out to every device that was
         # ringing so they all stop.
@@ -461,9 +545,19 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
     if msg_type == "call:end":
         call_id = message["call_id"]
         call = await calls_collection.find_one({"call_id": call_id})
-        update = {"status": "ended", "ended_at": datetime.now(timezone.utc)}
+        ended_at = datetime.now(timezone.utc)
+        # Attribute the end reason to whichever side actually hung up --
+        # useful for the audit trail (epic §29 distinguishes PATIENT_ENDED
+        # from CLINICIAN_ENDED).
+        end_reason = "COMPLETED"
+        if call:
+            if sender_id == call.get("callee_id"):
+                end_reason = "PATIENT_ENDED"
+            elif sender_id == call.get("caller_id"):
+                end_reason = "CLINICIAN_ENDED"
+        update = {"status": "ENDED", "end_reason": end_reason, "ended_at": ended_at}
         if call and call.get("started_at"):
-            duration = (update["ended_at"] - call["started_at"]).total_seconds()
+            duration = (ended_at - call["started_at"]).total_seconds()
             update["duration_seconds"] = int(duration)
         await calls_collection.update_one({"call_id": call_id}, {"$set": update})
         await manager.route(call_id, message["to"], {"type": "call:ended", "call_id": call_id, "from": sender_id})
@@ -479,6 +573,12 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             # Stale/replayed message for a call that's already over --
             # ignore instead of acting on invalid call state.
             return
+        if msg_type == "call:media-switch" and message.get("media") == "audio" and message.get("auto"):
+            # The client's automatic poor-connection fallback (distinct
+            # from a manual "switch to voice" tap) -- tag the call record
+            # so this is auditable, per the epic §21 requirement that
+            # audio-only participation be distinctly logged.
+            await calls_collection.update_one({"call_id": call_id}, {"$set": {"audio_only_fallback_occurred": True}})
         await manager.route(call_id, message["to"], {**message, "from": sender_id})
         return
 

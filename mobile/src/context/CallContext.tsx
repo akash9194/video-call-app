@@ -26,7 +26,7 @@ interface CallContextValue {
   endCall: () => void;
   toggleMute: () => void;
   switchToVideo: () => Promise<void>;
-  switchToVoice: () => void;
+  switchToVoice: (auto?: boolean) => void;
 }
 
 const CallContext = createContext<CallContextValue | undefined>(undefined);
@@ -57,6 +57,11 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   // callback and a signalingClient.onReconnect callback, both of which
   // close over stale state otherwise.
   const statsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Epic §21: the automatic audio-only fallback loop must be off unless the
+  // backend explicitly says it's approved (Settings.audio_only_auto_
+  // fallback_enabled). Fetched fresh per-call in setupPeerConnection, same
+  // as ICE servers, since it's config that can change without an app update.
+  const audioOnlyAutoFallbackEnabledRef = useRef(false);
   const poorVideoStreakRef = useRef(0);
   const lastVideoStatsRef = useRef<{ packetsLost: number; packetsReceived: number } | null>(null);
   const callIdRef = useRef<string | null>(null);
@@ -80,6 +85,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   // fallback beats an unpredictable one.
   const startStatsMonitor = () => {
     stopStatsMonitor();
+    if (!audioOnlyAutoFallbackEnabledRef.current) return;
     statsTimerRef.current = setInterval(async () => {
       const pc = pcRef.current;
       if (!pc || !isVideoOnRef.current) {
@@ -105,7 +111,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           if (poorVideoStreakRef.current >= 3) {
             poorVideoStreakRef.current = 0;
             console.warn('[call] sustained poor video conditions -- auto-falling back to audio-only');
-            switchToVoice();
+            switchToVoice(true);
           }
         }
         lastVideoStatsRef.current = now;
@@ -134,8 +140,9 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   };
 
   const setupPeerConnection = async (targetUserId: string, currentCallId: string, media: CallMedia) => {
-    const iceServers = await api.getIceServers();
-    const pc = createPeerConnection(iceServers);
+    const iceConfig = await api.getIceServersConfig();
+    audioOnlyAutoFallbackEnabledRef.current = !!iceConfig.audio_only_auto_fallback_enabled;
+    const pc = createPeerConnection(iceConfig.ice_servers);
     pcRef.current = pc;
 
     const stream = await getLocalStream(media === 'video');
@@ -255,11 +262,17 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   // disables it. This is simpler, faster, and works identically on every
   // platform; the track stays reserved in the connection so switching
   // back to video later (switchToVideo above) is instant.
-  const switchToVoice = () => {
+  const switchToVoice = (auto?: boolean) => {
     if (!callId || !remoteUserId) return;
     localStream?.getVideoTracks().forEach((t: any) => (t.enabled = false));
     setIsVideoOn(false);
-    signalingClient.send({ type: 'call:media-switch', call_id: callId, to: remoteUserId, media: 'audio' });
+    signalingClient.send({
+      type: 'call:media-switch',
+      call_id: callId,
+      to: remoteUserId,
+      media: 'audio',
+      ...(auto ? { auto: true } : {}),
+    });
   };
 
   useEffect(() => {

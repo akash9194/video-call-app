@@ -245,7 +245,8 @@ async def run_call_simulation():
     hist = requests.get(f"{BASE}/calls/history", headers={"Authorization": f"Bearer {a['access_token']}"}).json()
     call_record = next((c for c in hist if c["call_id"] == call_id), None)
     check("Call record exists in history", call_record is not None)
-    check("Call record status is 'ended'", call_record and call_record["status"] == "ended")
+    check("Call record status is 'ENDED'", call_record and call_record["status"] == "ENDED")
+    check("Call record end_reason is 'CLINICIAN_ENDED' (caller hung up)", call_record and call_record["end_reason"] == "CLINICIAN_ENDED")
     check("Call record has a duration_seconds value", call_record and call_record["duration_seconds"] is not None)
 
     if pc_a:

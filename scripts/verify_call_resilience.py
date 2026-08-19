@@ -4,19 +4,21 @@ ws_manager.py:
 
   1. Ringing timeout: a call nobody answers auto-expires -- caller gets
      call:timeout, callee's ringing UI is told to dismiss (call:cancelled,
-     reason=timeout), and the call record is marked 'missed' rather than
-     staying 'ringing' forever.
+     reason=timeout), and the call record is marked 'NO_ANSWER' rather than
+     staying 'RINGING' forever.
   2. Stale/replayed messages: a signaling message (call:accept, webrtc:*)
      for a call_id that's already ended is ignored rather than acted on.
   3. Reconnection: if the active callee's WebSocket drops mid-call, the
      caller is told (call:peer-disconnected) but the call is NOT ended
-     immediately. If that device reconnects with the SAME device_id within
-     the grace period, the caller is told call:peer-reconnected and
+     immediately -- interruption_count is incremented. If that device
+     reconnects with the SAME device_id within the grace period, the caller
+     is told call:peer-reconnected (reconnection_count incremented) and
      signaling for the call still routes correctly to the reconnected
      device (proving the server re-associated it, not just tolerated it).
   4. If the disconnected device does NOT come back within the grace
-     period, the call is cleanly ended (call:ended, reason=peer_disconnected)
-     instead of hanging forever on the other side.
+     period, the call is cleanly ended (call:ended, reason=peer_disconnected;
+     persisted status 'DROPPED', end_reason 'NETWORK_FAILURE') instead of
+     hanging forever on the other side.
 
 Needs RINGING_TIMEOUT_SECONDS and DISCONNECT_GRACE_SECONDS set low in the
 server's environment (see the shell command used to run this) -- otherwise
@@ -133,7 +135,8 @@ async def main():
 
     hist = requests.get(f"{BASE}/calls/history", headers={"Authorization": f"Bearer {doc_acc['access_token']}"}).json()
     record = next((c for c in hist if c["call_id"] == call_id), None)
-    check("expired call record status is 'missed'", record is not None and record["status"] == "missed")
+    check("expired call record status is 'NO_ANSWER'", record is not None and record["status"] == "NO_ANSWER")
+    check("expired call record end_reason is 'NO_ANSWER'", record is not None and record["end_reason"] == "NO_ANSWER")
 
     # ---------------------------------------------------------------
     # 2. Stale/replayed message for a call that's already over.
@@ -153,7 +156,7 @@ async def main():
 
     hist2 = requests.get(f"{BASE}/calls/history", headers={"Authorization": f"Bearer {doc_acc['access_token']}"}).json()
     record2 = next((c for c in hist2 if c["call_id"] == call_id), None)
-    check("dead call record is still 'missed', not resurrected to 'active'", record2 is not None and record2["status"] == "missed")
+    check("dead call record is still 'NO_ANSWER', not resurrected to 'CONNECTED'", record2 is not None and record2["status"] == "NO_ANSWER")
 
     await doctor.ws.close()
     await patient.ws.close()
@@ -197,7 +200,9 @@ async def main():
 
     hist3 = requests.get(f"{BASE}/calls/history", headers={"Authorization": f"Bearer {doc_acc['access_token']}"}).json()
     record3 = next((c for c in hist3 if c["call_id"] == call_id2), None)
-    check("recovered call is still 'active', not ended by the drop", record3 is not None and record3["status"] == "active")
+    check("recovered call is still 'CONNECTED', not ended by the drop", record3 is not None and record3["status"] == "CONNECTED")
+    check("interruption_count was incremented by the drop", record3 is not None and record3.get("interruption_count", 0) >= 1)
+    check("reconnection_count was incremented by the recovery", record3 is not None and record3.get("reconnection_count", 0) >= 1)
 
     await doctor2.send({"type": "call:end", "call_id": call_id2, "to": patient_id})
     await asyncio.sleep(0.2)
@@ -230,7 +235,8 @@ async def main():
 
     hist4 = requests.get(f"{BASE}/calls/history", headers={"Authorization": f"Bearer {pat_acc['access_token']}"}).json()
     record4 = next((c for c in hist4 if c["call_id"] == call_id3), None)
-    check("abandoned call record status is 'ended'", record4 is not None and record4["status"] == "ended")
+    check("abandoned call record status is 'DROPPED'", record4 is not None and record4["status"] == "DROPPED")
+    check("abandoned call record end_reason is 'NETWORK_FAILURE'", record4 is not None and record4["end_reason"] == "NETWORK_FAILURE")
 
     await patient3.ws.close()
 

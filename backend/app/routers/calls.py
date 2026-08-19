@@ -16,7 +16,10 @@ async def get_ice_servers(current_user: dict = Depends(get_current_user)):
     Settings.turn_credentials) and passes it straight into the
     RTCPeerConnection config.
     """
-    return IceServersResponse(ice_servers=settings.ice_servers(str(current_user["_id"])))
+    return IceServersResponse(
+        ice_servers=settings.ice_servers(str(current_user["_id"])),
+        audio_only_auto_fallback_enabled=settings.audio_only_auto_fallback_enabled,
+    )
 
 
 @router.get("/history", response_model=list[CallOut])

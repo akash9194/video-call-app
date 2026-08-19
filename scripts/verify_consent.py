@@ -108,8 +108,9 @@ async def main():
 
     hist_mid = requests.get(f"{BASE}/calls/history", headers={"Authorization": f"Bearer {doc_acc['access_token']}"}).json()
     record_mid = next((c for c in hist_mid if c["call_id"] == call_id), None)
-    check("call record still shows status 'ringing' after the rejected accept", record_mid is not None and record_mid["status"] == "ringing")
+    check("call record still shows status 'RINGING' after the rejected accept", record_mid is not None and record_mid["status"] == "RINGING")
     check("call record still shows consent_given False", record_mid is not None and record_mid["consent_given"] is False)
+    check("rejected accept incremented permission_failures", record_mid is not None and record_mid.get("permission_failures") == 1)
 
     print("\nStep 3: patient retries with consent:true -- must succeed")
     await patient.send({"type": "call:accept", "call_id": call_id, "to": doctor_id, "consent": True})
@@ -120,9 +121,10 @@ async def main():
     hist = requests.get(f"{BASE}/calls/history", headers={"Authorization": f"Bearer {doc_acc['access_token']}"}).json()
     record = next((c for c in hist if c["call_id"] == call_id), None)
     check("call record found in history", record is not None)
-    check("call record status is 'active'", record is not None and record["status"] == "active")
+    check("call record status is 'CONNECTED'", record is not None and record["status"] == "CONNECTED")
     check("call record consent_given is True", record is not None and record["consent_given"] is True)
     check("call record has a consent_at timestamp", record is not None and record.get("consent_at") is not None)
+    check("call record has an answered_at timestamp", record is not None and record.get("answered_at") is not None)
 
     # Clean up.
     await doctor.send({"type": "call:end", "call_id": call_id, "to": patient_id})

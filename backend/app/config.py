@@ -41,6 +41,29 @@ class Settings(BaseSettings):
     turn_shared_secret: str = ""
     turn_credential_ttl_seconds: int = 3600
 
+    # Role -> permission mapping. Only VIDEO_CALL_INITIATE is checked today
+    # (see ws_manager.py's call:invite handler). Which roles hold it is
+    # deliberately not a hardcoded `role == "doctor"` comparison -- the
+    # Command Centre epic (§6) requires "the exact role list should remain
+    # configurable." Override via env without a code/redeploy change to the
+    # signaling logic itself.
+    video_call_initiate_roles: str = "doctor"
+
+    # Off by default: the epic (§21) requires audio-only fallback be
+    # explicitly approved by Business/Medical before it's allowed at all,
+    # and every audio-only call logged distinctly (see calls.audio_only_
+    # fallback_occurred). Flip to true only once that approval exists.
+    audio_only_auto_fallback_enabled: bool = False
+
+    @property
+    def video_call_initiate_role_set(self) -> set[str]:
+        return {r.strip() for r in self.video_call_initiate_roles.split(",") if r.strip()}
+
+    def has_permission(self, role: str, permission: str) -> bool:
+        if permission == "VIDEO_CALL_INITIATE":
+            return role in self.video_call_initiate_role_set
+        return False
+
     @property
     def cors_origin_list(self) -> list[str]:
         if self.cors_origins == "*":

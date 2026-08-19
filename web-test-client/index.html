@@ -172,6 +172,11 @@ let isRemoteVideoOn = false;
 let usersPollTimer = null;
 let wsReconnectTimer = null;
 let statsTimer = null, poorVideoStreak = 0, lastVideoStats = null;
+// Off until the backend says otherwise (Settings.audio_only_auto_fallback_
+// enabled) -- epic §21 requires automatic audio-only fallback be explicitly
+// Business/Medical-approved before it's allowed to run at all. Fetched
+// fresh from /calls/ice-servers at the start of every call.
+let audioOnlyAutoFallbackEnabled = false;
 
 // A stable per-browser device_id, persisted across reloads, is what lets a
 // dropped WebSocket reconnect as the SAME device server-side (see
@@ -539,7 +544,8 @@ function endCall() {
 
 async function setupPeerConnection(wantVideo) {
   const iceResp = await fetch(apiBase + '/calls/ice-servers', { headers: { Authorization: 'Bearer ' + token } });
-  const { ice_servers } = await iceResp.json();
+  const { ice_servers, audio_only_auto_fallback_enabled } = await iceResp.json();
+  audioOnlyAutoFallbackEnabled = !!audio_only_auto_fallback_enabled;
   pc = new RTCPeerConnection({ iceServers: ice_servers });
 
   localStream = await navigator.mediaDevices.getUserMedia({ video: !!wantVideo, audio: true });
@@ -576,6 +582,10 @@ async function setupPeerConnection(wantVideo) {
 // way either way.
 function startStatsMonitor() {
   stopStatsMonitor();
+  // Gated by the backend flag (epic §21) -- don't even poll if automatic
+  // fallback isn't approved/enabled, so there's no ambiguity about why it
+  // isn't kicking in.
+  if (!audioOnlyAutoFallbackEnabled) return;
   statsTimer = setInterval(monitorCallQuality, 5000);
 }
 function stopStatsMonitor() {
@@ -601,7 +611,7 @@ async function monitorCallQuality() {
       if (poorVideoStreak >= 3) {
         poorVideoStreak = 0;
         console.warn('Sustained poor video conditions -- auto-falling back to audio-only');
-        switchToVoice();
+        switchToVoice(true); // true = automatic, so the backend tags this call's audit record distinctly (audio_only_fallback_occurred)
         document.getElementById('call-status').textContent = 'Switched to audio-only (poor connection)';
       }
     }
@@ -672,13 +682,13 @@ async function switchToVideo() {
 
 // Turning video OFF never removes the track or renegotiates -- just
 // disables it, so switching back to video later is instant.
-function switchToVoice() {
+function switchToVoice(auto) {
   if (!callId || !otherId) return;
   if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = false);
   isVideoOn = false;
   updateLocalVideoVisibility();
   updateSwitchButton();
-  send({ type: 'call:media-switch', call_id: callId, to: otherId, media: 'audio' });
+  send({ type: 'call:media-switch', call_id: callId, to: otherId, media: 'audio', ...(auto ? { auto: true } : {}) });
 }
 
 function cleanupCall() {
