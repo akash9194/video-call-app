@@ -55,6 +55,13 @@ class Settings(BaseSettings):
     # fallback_occurred). Flip to true only once that approval exists.
     audio_only_auto_fallback_enabled: bool = False
 
+    # Epic §28 / §3: "call session/room with a time-limited token", called
+    # out explicitly as missing ("no separate time-limited call-session
+    # token beyond call_id + JWT"). Short-lived, scoped to one (call_id,
+    # user_id) pair -- see call_session_token()/verify_call_session_token()
+    # below for what this is (and isn't) used for today.
+    call_session_token_ttl_seconds: int = 600
+
     @property
     def video_call_initiate_role_set(self) -> set[str]:
         return {r.strip() for r in self.video_call_initiate_roles.split(",") if r.strip()}
@@ -90,6 +97,57 @@ class Settings(BaseSettings):
         digest = hmac.new(self.turn_shared_secret.encode("utf-8"), username.encode("utf-8"), hashlib.sha1).digest()
         password = base64.b64encode(digest).decode("utf-8")
         return username, password
+
+    def call_session_token(self, call_id: str, user_id: str) -> tuple[str, int]:
+        """
+        Epic §28/§3's "call session/room with a time-limited token" --
+        distinct from the user's JWT (which authenticates them generally,
+        for however long the JWT lives) and distinct from call_id itself
+        (which just names the call, isn't a credential). This proves "this
+        specific user was a legitimate participant on this specific call,
+        as of recently" and expires quickly on its own.
+
+        Same HMAC-over-a-colon-joined-payload construction as
+        turn_credentials() above, deliberately -- one signing pattern for
+        every short-lived, self-verifying credential this backend mints,
+        rather than pulling in a second token format/library.
+
+        Today, nothing in this codebase actually gates access on this
+        token -- the REST endpoints that act on a call_id (notes, events)
+        already enforce participant membership directly against the call
+        record, which doesn't expire and can't be replayed independently
+        of the JWT, so it's arguably the stronger check for those. This
+        exists for the boundary the epic is actually describing: handing
+        a call-scoped credential to something that shouldn't hold the full
+        user JWT -- a future native CallKit/Telecom action handler, or an
+        embedded widget -- once a concrete consumer exists. Issued at
+        call:accept (see ws_manager.py) and via GET
+        /calls/{call_id}/session-token while the call is live.
+
+        Returns (token, expires_at_unix_timestamp).
+        """
+        expiry = int(time.time()) + self.call_session_token_ttl_seconds
+        payload = f"{call_id}:{user_id}:{expiry}"
+        sig = hmac.new(self.jwt_secret_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"{payload}:{sig}", expiry
+
+    def verify_call_session_token(self, token: str, call_id: str, user_id: str) -> bool:
+        """True iff `token` was minted by call_session_token() for exactly
+        this (call_id, user_id) pair, and hasn't expired yet."""
+        try:
+            t_call_id, t_user_id, t_expiry, t_sig = token.split(":", 3)
+        except (ValueError, AttributeError):
+            return False
+        if t_call_id != call_id or t_user_id != user_id:
+            return False
+        expected_payload = f"{t_call_id}:{t_user_id}:{t_expiry}"
+        expected_sig = hmac.new(self.jwt_secret_key.encode("utf-8"), expected_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_sig, t_sig):
+            return False
+        try:
+            return int(t_expiry) >= int(time.time())
+        except ValueError:
+            return False
 
     def ice_servers(self, user_id: str) -> list[dict]:
         servers = [{"urls": [u.strip() for u in self.stun_urls.split(",") if u.strip()]}]

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from app.config import settings
 from app.database import analytics_events_collection, calls_collection
 from app.auth.dependencies import get_current_user
-from app.schemas.call import CallOut, CallNotesUpdate, IceServersResponse, OUTCOMES
+from app.schemas.call import CallOut, CallNotesUpdate, CallSessionTokenResponse, IceServersResponse, OUTCOMES
 
 router = APIRouter(prefix="/calls", tags=["calls"])
 
@@ -41,6 +41,32 @@ async def call_history(current_user: dict = Depends(get_current_user)):
 
 
 TERMINAL_STATUSES = {"DECLINED", "NO_ANSWER", "CANCELLED", "ENDED", "DROPPED"}
+LIVE_STATUSES = {"RINGING", "CONNECTED"}
+
+
+@router.get("/{call_id}/session-token", response_model=CallSessionTokenResponse)
+async def get_call_session_token(call_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Epic §28/§3 call-session token (see Settings.call_session_token for
+    the full rationale). Also delivered proactively over the WebSocket at
+    call:accept (see ws_manager.py) -- this REST endpoint exists so a
+    client that reconnects or needs a fresh one mid-call (the WS-delivered
+    one may have since expired) doesn't have to wait for another signaling
+    round-trip. Only issued while the call is actually live: a token for
+    an ended call authorizes nothing today, and minting one would be
+    misleading about what "session" it refers to.
+    """
+    call = await calls_collection.find_one({"call_id": call_id})
+    if not call:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found")
+    user_id = str(current_user["_id"])
+    if user_id not in (call.get("caller_id"), call.get("callee_id")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You weren't a participant on this call")
+    if call.get("status") not in LIVE_STATUSES:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This call isn't live -- no session token to issue")
+
+    token, expires_at = settings.call_session_token(call_id, user_id)
+    return CallSessionTokenResponse(token=token, expires_at=expires_at)
 
 
 @router.patch("/{call_id}/notes", response_model=CallOut)

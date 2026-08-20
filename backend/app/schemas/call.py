@@ -100,9 +100,8 @@ class CallOut(BaseModel):
     # `media`, which only reflects how the call *started*.
     audio_only_fallback_occurred: bool = False
 
-    # Not yet populated by either client -- both fields exist so the audit
-    # schema matches the epic (§29) without a later migration, but nothing
-    # sends this information to the backend today.
+    # Self-reported by each client in call:invite/call:accept's optional
+    # "platform" field ("ios" | "android" | "web") -- see ws_manager.py.
     caller_platform: str | None = None
     callee_platform: str | None = None
 
@@ -127,6 +126,12 @@ class CallOut(BaseModel):
     # signaling message (see ws_manager.py); this is just the
     # last-known-value snapshot for call history / post-call review.
     last_network_quality: dict[str, str] = {}
+
+
+class CallSessionTokenResponse(BaseModel):
+    # See Settings.call_session_token for what this is and isn't used for.
+    token: str
+    expires_at: int  # unix timestamp
 
 
 class IceServersResponse(BaseModel):

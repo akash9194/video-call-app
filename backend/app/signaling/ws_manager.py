@@ -36,6 +36,7 @@ Protocol (all messages are JSON with a "type" field):
     webrtc:offer / answer / ice-candidate  (relayed as-is)
     call:media-switch      { call_id, from: userId, media: "audio" | "video" }  (relayed as-is)
     call:network-quality   { call_id, from: userId, quality: "good" | "fair" | "poor" }  (relayed as-is)
+    call:session-token     { call_id, token, expires_at }  (sent to each side individually once CONNECTED -- see Settings.call_session_token)
     presence:update         { user_id, is_online }
     error                   { message, code }
 
@@ -542,6 +543,22 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
         await calls_collection.update_one({"call_id": call_id}, {"$set": accept_update})
         await emit_event("call_connected", call_id=call_id, callee_id=sender_id)
         await manager.route(call_id, message["to"], {"type": "call:accepted", "call_id": call_id, "from": sender_id})
+
+        # Epic §28/§3 call-session token -- mint one for each side now that
+        # the call is actually connected, and push it to their pinned
+        # device. See Settings.call_session_token for what this is (and
+        # isn't yet) used for; also fetchable via GET
+        # /calls/{call_id}/session-token for as long as the call stays live.
+        caller_participant = participants.get("caller")
+        callee_participant = participants.get("callee")
+        if caller_participant:
+            caller_user_id, caller_device = caller_participant
+            token, expires_at = settings.call_session_token(call_id, caller_user_id)
+            await manager.send_to_device(caller_user_id, caller_device, {"type": "call:session-token", "call_id": call_id, "token": token, "expires_at": expires_at})
+        if callee_participant:
+            callee_user_id, callee_device = callee_participant
+            token, expires_at = settings.call_session_token(call_id, callee_user_id)
+            await manager.send_to_device(callee_user_id, callee_device, {"type": "call:session-token", "call_id": call_id, "token": token, "expires_at": expires_at})
         return
 
     if msg_type == "call:reject":
