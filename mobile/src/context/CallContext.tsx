@@ -85,12 +85,19 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   const lastAudioStatsRef = useRef<{ packetsLost: number; packetsReceived: number } | null>(null);
   const lastReportedQualityRef = useRef<NetworkQuality | null>(null);
   const [networkQuality, setNetworkQuality] = useState<NetworkQuality | null>(null);
+  // Epic §30: whether THIS call ever actually connected (reached 'active'),
+  // as opposed to ringing out, being declined, or the caller cancelling
+  // first. Post-call notes only make sense for a call that happened --
+  // read by finishCall() below, reset alongside everything else in
+  // resetCallState().
+  const everConnectedRef = useRef(false);
   const callIdRef = useRef<string | null>(null);
   const remoteUserIdRef = useRef<string | null>(null);
   const isVideoOnRef = useRef(false);
   useEffect(() => { callIdRef.current = callId; }, [callId]);
   useEffect(() => { remoteUserIdRef.current = remoteUserId; }, [remoteUserId]);
   useEffect(() => { isVideoOnRef.current = isVideoOn; }, [isVideoOn]);
+  useEffect(() => { if (status === 'active') everConnectedRef.current = true; }, [status]);
 
   // Epic §10 ringing-duration timer. Ticks only while we're the caller
   // waiting for an answer; resets to 0 the instant we leave that state
@@ -211,7 +218,33 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     setIsVideoOn(false);
     setIsRemoteVideoOn(false);
     setIsSpeakerOn(false);
+    everConnectedRef.current = false;
     InCallManager.stop();
+  };
+
+  // Epic §30: the single place every "this call is over" path routes
+  // through to decide where to send the user next. Reads callId/
+  // remoteUserName/everConnectedRef BEFORE resetCallState() clears them --
+  // order matters here.
+  //
+  // Only a doctor who was actually connected (not just ringing) gets
+  // routed to the notes screen: notes/outcome are a clinical record of
+  // what happened on the call, so they don't make sense for a call that
+  // never connected, and today's OUTCOMES vocabulary (RESOLVED, REFERRED,
+  // ESCALATED, ...) is clinician framing, not something a patient should
+  // be prompted to fill in about their own visit. A patient can still see
+  // any notes added via call history -- there just isn't a prompt for one
+  // here.
+  const finishCall = () => {
+    const finishedCallId = callId;
+    const finishedRemoteName = remoteUserName;
+    const shouldPromptNotes = everConnectedRef.current && !!finishedCallId && user?.role === 'doctor';
+    resetCallState();
+    if (shouldPromptNotes) {
+      navigate('PostCallNotes', { callId: finishedCallId as string, remoteUserName: finishedRemoteName || '' });
+    } else {
+      navigate('Home');
+    }
   };
 
   const setupPeerConnection = async (targetUserId: string, currentCallId: string, media: CallMedia) => {
@@ -289,7 +322,11 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     if (callId && remoteUserId) {
       signalingClient.send({ type: 'call:end', call_id: callId, to: remoteUserId });
     }
-    resetCallState();
+    // Previously this only reset local state and never navigated anywhere,
+    // leaving whoever tapped "End" stranded on the (now-blank) Call screen
+    // until they backgrounded and reopened the app. finishCall() (epic
+    // §30) fixes that as a side effect of adding the notes-screen routing.
+    finishCall();
   };
 
   const toggleMute = () => {
@@ -564,8 +601,12 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           // here" case.
           if (callId !== null && msg.call_id && msg.call_id !== callId) break;
           InCallManager.stopRingtone();
-          resetCallState();
-          navigate('Home');
+          // finishCall() (epic §30) routes a doctor to the post-call notes
+          // screen instead of Home when the call actually connected --
+          // 'call:ended' (the peer hung up) is the realistic case that can
+          // hit that branch; rejected/user-offline/answered-elsewhere never
+          // reach 'active' so they always just go Home, same as before.
+          finishCall();
           break;
         }
       }

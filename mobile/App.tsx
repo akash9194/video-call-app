@@ -13,6 +13,7 @@ import HomeScreen from './src/screens/HomeScreen';
 import ScheduleScreen from './src/screens/ScheduleScreen';
 import CallScreen from './src/screens/CallScreen';
 import IncomingCallScreen from './src/screens/IncomingCallScreen';
+import PostCallNotesScreen from './src/screens/PostCallNotesScreen';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
@@ -43,6 +44,7 @@ function RootNavigator() {
           <Stack.Screen name="Schedule" component={ScheduleScreen} />
           <Stack.Screen name="IncomingCall" component={IncomingCallScreen} />
           <Stack.Screen name="Call" component={CallScreen} options={{ gestureEnabled: false }} />
+          <Stack.Screen name="PostCallNotes" component={PostCallNotesScreen} options={{ gestureEnabled: false }} />
         </>
       ) : (
         <>

@@ -48,6 +48,20 @@ export type SignalingMessage =
   | { type: 'presence:update'; user_id: string; is_online: boolean }
   | { type: 'error'; message: string; code?: string };
 
+// Mirrors backend/app/schemas/call.py's OUTCOMES tuple (epic §30). Kept as
+// a plain array here rather than importing from the backend (there's no
+// shared package between mobile and backend in this repo) -- if the
+// backend list ever changes, this needs a matching manual update, same as
+// everywhere else this project duplicates a small enum across the
+// language boundary (see networkQuality.ts's bucketing logic).
+export const CALL_OUTCOMES: { value: string; label: string }[] = [
+  { value: 'RESOLVED', label: 'Resolved' },
+  { value: 'FOLLOW_UP_REQUIRED', label: 'Follow-up required' },
+  { value: 'REFERRED', label: 'Referred' },
+  { value: 'ESCALATED', label: 'Escalated' },
+  { value: 'NO_CLINICAL_ACTION', label: 'No clinical action needed' },
+];
+
 export type CallStatus =
   | 'idle'
   | 'calling' // we invited, waiting for answer

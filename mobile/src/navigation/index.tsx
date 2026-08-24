@@ -10,6 +10,10 @@ export type RootStackParamList = {
   Schedule: { patientId: string; patientName: string };
   Call: { callId: string; remoteUserId: string; remoteUserName: string; isCaller: boolean };
   IncomingCall: { callId: string; fromUserId: string; fromUserName: string; media: CallMedia };
+  // Epic §30 -- shown after a call that actually connected ends, doctor
+  // side only (see CallContext's finishCall). callId is the now-ended
+  // call whose /notes endpoint this screen PATCHes.
+  PostCallNotes: { callId: string; remoteUserName: string };
 };
 
 export type NavProp = NativeStackNavigationProp<RootStackParamList>;
