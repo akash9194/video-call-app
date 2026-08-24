@@ -14,3 +14,6 @@ pydantic[email]>=2.9,<3.0
 pydantic-settings>=2.5,<3.0
 python-multipart>=0.0.9,<0.1
 websockets>=12.0,<14.0
+# Epic §35 alerting layer (app/alerting.py) -- async client for the
+# optional outbound webhook notification.
+httpx>=0.27,<1.0

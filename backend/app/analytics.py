@@ -47,3 +47,15 @@ async def emit_event(event_type: str, **fields) -> None:
         # Analytics is best-effort -- a DB hiccup here must never break
         # call signaling itself. Log and move on.
         logger.exception("failed to persist analytics event %s", event_type)
+        # Epic §35: a write failure here usually means Mongo itself is
+        # unreachable or degraded -- exactly the kind of thing an operator
+        # needs to know about, not just have sitting in a log file. Import
+        # is local to avoid a circular import (alerting.py doesn't import
+        # analytics, but keeping it local here makes that non-dependency
+        # explicit rather than accidental).
+        from app.alerting import raise_alert
+
+        try:
+            await raise_alert("analytics_write_failed", f"Could not persist analytics event {event_type}", event_type=event_type)
+        except Exception:
+            logger.exception("raise_alert itself failed for analytics_write_failed")

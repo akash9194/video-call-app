@@ -149,6 +149,7 @@ from datetime import datetime, timezone
 
 from fastapi import WebSocket
 from bson import ObjectId
+from bson.errors import InvalidId
 
 from app.analytics import emit_event
 from app.config import settings
@@ -366,7 +367,22 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
     msg_type = message.get("type")
 
     if msg_type == "call:invite":
-        callee_id = message["to"]
+        # Both of these were previously unguarded (message["to"] raw
+        # indexing, and ObjectId(callee_id) with no try/except) -- a
+        # missing or malformed "to" crashed this handler with an unhandled
+        # KeyError or bson.errors.InvalidId. routers/ws.py's outer
+        # try/except kept that from tearing down the connection, but the
+        # sender just got silent nothing back instead of a real error --
+        # caught by scripts/verify_alerting.py exercising the new epic §35
+        # alerting layer against this exact handler. Fixed as normal input
+        # validation, same shape as every other rejection below.
+        callee_id = message.get("to")
+        if not callee_id:
+            await manager.send_to_device(
+                sender_id, sender_device_id,
+                {"type": "error", "message": "Missing callee.", "code": "invalid_callee"},
+            )
+            return
         media = message.get("media", "video")
         if media not in ("audio", "video"):
             media = "video"
@@ -385,7 +401,15 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             await emit_event("permission_denied", user_id=sender_id, role=sender_role, code="not_authorized_to_call")
             return
 
-        callee = await users_collection.find_one({"_id": ObjectId(callee_id)})
+        try:
+            callee_object_id = ObjectId(callee_id)
+        except InvalidId:
+            await manager.send_to_device(
+                sender_id, sender_device_id,
+                {"type": "error", "message": "You can only call a patient.", "code": "invalid_callee"},
+            )
+            return
+        callee = await users_collection.find_one({"_id": callee_object_id})
         if not callee or callee.get("role") != "patient":
             await manager.send_to_device(
                 sender_id, sender_device_id,

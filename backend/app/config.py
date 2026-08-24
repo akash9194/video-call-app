@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     # fallback_occurred). Flip to true only once that approval exists.
     audio_only_auto_fallback_enabled: bool = False
 
+    # Epic §35: alerting layer on top of the structured logging/analytics
+    # in app/analytics.py. Empty by default -- alerts still get logged at
+    # ERROR and persisted to alerts_collection either way (see
+    # app/alerting.py), this just adds a best-effort push notification on
+    # top. Any endpoint that accepts a JSON POST works; written against
+    # Slack's incoming-webhook payload shape ({"text": "..."}) since that's
+    # the most common self-hosted "tell someone" sink and a great many
+    # other tools (Discord, Mattermost, generic webhook relays) accept the
+    # same shape or something close enough.
+    alert_webhook_url: str = ""
+
     # Epic §28 / §3: "call session/room with a time-limited token", called
     # out explicitly as missing ("no separate time-limited call-session
     # token beyond call_id + JWT"). Short-lived, scoped to one (call_id,

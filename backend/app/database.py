@@ -18,6 +18,13 @@ appointments_collection = db["appointments"]
 # calls_collection (which holds one evolving document per call) so this
 # stays a pure append-only event log -- see app/analytics.py.
 analytics_events_collection = db["analytics_events"]
+# Epic §35 -- alerting layer on top of the analytics events above. A
+# genuine operational failure (unhandled exception in signaling, a DB
+# write failure) lands here via app/alerting.py's raise_alert(), separate
+# from analytics_events_collection because these are failures the system
+# itself detected, not call-outcome data -- see app/alerting.py's
+# docstring for exactly what does and doesn't raise one.
+alerts_collection = db["alerts"]
 
 
 async def ensure_indexes():
@@ -29,3 +36,4 @@ async def ensure_indexes():
     await appointments_collection.create_index([("doctor_id", 1), ("patient_id", 1), ("status", 1)])
     await analytics_events_collection.create_index("call_id")
     await analytics_events_collection.create_index([("event_type", 1), ("timestamp", -1)])
+    await alerts_collection.create_index([("alert_type", 1), ("timestamp", -1)])
