@@ -55,6 +55,37 @@ async def _test_list_alerts():
     return docs
 
 
+# Test-only, for scripts/verify_tenant_enforcement.py (epic §6/§28). The
+# real POST /appointments already refuses to create a cross-tenant
+# appointment (see routers/appointments.py), which means the normal API
+# can't produce the exact bad state the WS-level tenant check in
+# ws_manager.py's call:invite is meant to catch as defense-in-depth. This
+# writes one directly to the DB, bypassing that check on purpose, so the
+# WS-level check can be proven to catch it independently rather than just
+# trusting that it would.
+@_debug_router.post("/_test/seed-cross-tenant-appointment")
+async def _test_seed_cross_tenant_appointment(body: dict):
+    import uuid
+    from datetime import datetime, timezone
+
+    from app.database import appointments_collection
+
+    doc = {
+        "appointment_id": str(uuid.uuid4()),
+        "doctor_id": body["doctor_id"],
+        "doctor_name": body.get("doctor_name", "Test Doctor"),
+        "patient_id": body["patient_id"],
+        "patient_name": body.get("patient_name", "Test Patient"),
+        "scheduled_time": datetime.now(timezone.utc),
+        "status": "scheduled",
+        "notes": None,
+        "created_at": datetime.now(timezone.utc),
+        "tenant_id": body.get("tenant_id", "default"),
+    }
+    await appointments_collection.insert_one(doc)
+    return {"appointment_id": doc["appointment_id"]}
+
+
 app.include_router(_debug_router)
 
 # Test-only fault injection for scripts/verify_alerting.py (epic §35). The
@@ -70,10 +101,10 @@ import app.routers.ws as _ws_router_module  # noqa: E402
 _original_handle_message = _ws_router_module.handle_message
 
 
-async def _handle_message_with_test_hook(sender_id, sender_device_id, sender_name, sender_role, message):
+async def _handle_message_with_test_hook(sender_id, sender_device_id, sender_name, sender_role, sender_tenant_id, message):
     if isinstance(message, dict) and message.get("type") == "__test:trigger_exception__":
         raise RuntimeError("deliberately injected by scripts/verify_alerting.py")
-    return await _original_handle_message(sender_id, sender_device_id, sender_name, sender_role, message)
+    return await _original_handle_message(sender_id, sender_device_id, sender_name, sender_role, sender_tenant_id, message)
 
 
 _ws_router_module.handle_message = _handle_message_with_test_hook

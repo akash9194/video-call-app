@@ -18,6 +18,9 @@ class AppointmentOut(BaseModel):
     status: str  # "scheduled" | "completed" | "cancelled"
     notes: str | None = None
     created_at: datetime
+    # Epic §6/§28 -- inherited from the scheduling doctor at creation time,
+    # never client-supplied (see routers/appointments.py's create_appointment).
+    tenant_id: str = "default"
 
 
 class AppointmentStatusUpdate(BaseModel):

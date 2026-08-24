@@ -363,7 +363,9 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-async def handle_message(sender_id: str, sender_device_id: str, sender_name: str, sender_role: str, message: dict):
+async def handle_message(
+    sender_id: str, sender_device_id: str, sender_name: str, sender_role: str, sender_tenant_id: str, message: dict
+):
     msg_type = message.get("type")
 
     if msg_type == "call:invite":
@@ -411,6 +413,24 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
             return
         callee = await users_collection.find_one({"_id": callee_object_id})
         if not callee or callee.get("role") != "patient":
+            await manager.send_to_device(
+                sender_id, sender_device_id,
+                {"type": "error", "message": "You can only call a patient.", "code": "invalid_callee"},
+            )
+            return
+
+        # -- Tenant scoping (epic §6/§28) ---------------------------------
+        # Defense-in-depth, not the primary gate: the appointment check
+        # just below already ties caller and callee together, and
+        # routers/appointments.py's create_appointment already refuses to
+        # create a cross-tenant appointment in the first place. This
+        # exists for the case that matters most -- a bad or stale
+        # appointment record (seeded directly, migrated from another
+        # system, edited by hand) shouldn't be enough on its own to bridge
+        # two tenants. Same "You can only call a patient." rejection as
+        # the checks above, deliberately -- a cross-tenant patient should
+        # look indistinguishable from an invalid one to the caller.
+        if callee.get("tenant_id", "default") != sender_tenant_id:
             await manager.send_to_device(
                 sender_id, sender_device_id,
                 {"type": "error", "message": "You can only call a patient.", "code": "invalid_callee"},
@@ -468,7 +488,7 @@ async def handle_message(sender_id: str, sender_device_id: str, sender_name: str
                 "caller_id": sender_id,
                 "callee_id": callee_id,
                 "caller_role": sender_role,
-                "tenant_id": "default",
+                "tenant_id": sender_tenant_id,
                 "media": media,
                 "status": "RINGING",
                 "end_reason": None,

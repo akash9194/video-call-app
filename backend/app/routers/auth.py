@@ -13,18 +13,20 @@ async def signup(payload: UserSignup):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    tenant_id = (payload.tenant_id or "").strip() or "default"
     user_doc = {
         "name": payload.name,
         "email": payload.email,
         "password_hash": hash_password(payload.password),
         "role": payload.role,
         "is_online": False,
+        "tenant_id": tenant_id,
     }
     result = await users_collection.insert_one(user_doc)
     user_id = str(result.inserted_id)
 
     token = create_access_token({"sub": user_id})
-    user_out = UserOut(id=user_id, name=payload.name, email=payload.email, role=payload.role)
+    user_out = UserOut(id=user_id, name=payload.name, email=payload.email, role=payload.role, tenant_id=tenant_id)
     return TokenResponse(access_token=token, user=user_out)
 
 
@@ -41,5 +43,6 @@ async def login(payload: UserLogin):
         email=user["email"],
         role=user["role"],
         is_online=user.get("is_online", False),
+        tenant_id=user.get("tenant_id", "default"),
     )
     return TokenResponse(access_token=token, user=user_out)

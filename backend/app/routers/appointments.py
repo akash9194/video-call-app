@@ -35,6 +35,14 @@ async def create_appointment(body: AppointmentCreate, current_user: dict = Depen
     if not patient or patient["role"] != "patient":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
 
+    # Epic §6/§28: a doctor can only schedule with a patient in their own
+    # tenant. 404 rather than 403 -- same reasoning as the role-mismatch
+    # check just above: a doctor probing for patient IDs shouldn't be able
+    # to distinguish "wrong tenant" from "doesn't exist" from the response.
+    doctor_tenant_id = current_user.get("tenant_id", "default")
+    if patient.get("tenant_id", "default") != doctor_tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+
     doc = {
         "appointment_id": str(uuid.uuid4()),
         "doctor_id": str(current_user["_id"]),
@@ -45,6 +53,7 @@ async def create_appointment(body: AppointmentCreate, current_user: dict = Depen
         "status": "scheduled",
         "notes": body.notes,
         "created_at": datetime.now(timezone.utc),
+        "tenant_id": doctor_tenant_id,
     }
     await appointments_collection.insert_one(doc)
     return AppointmentOut(id=doc["appointment_id"], **{k: doc[k] for k in doc if k != "appointment_id"})

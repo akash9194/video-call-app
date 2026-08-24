@@ -44,7 +44,9 @@ async def signaling_endpoint(websocket: WebSocket, token: str = Query(...), devi
             # receiving calls) until the app reconnects. Only a real
             # disconnect should end this loop.
             try:
-                await handle_message(user_id, connection_device_id, user["name"], user["role"], message)
+                await handle_message(
+                    user_id, connection_device_id, user["name"], user["role"], user.get("tenant_id", "default"), message
+                )
             except Exception as exc:
                 logger.exception("Error handling signaling message %r from user %s", message, user_id)
                 # Epic §35: this is exactly the failure mode the alerting
