@@ -190,6 +190,8 @@
 </div>
 
 <script src="network-quality.js"></script>
+<script src="video-quality-adaptation.js"></script>
+<script src="media-errors.js"></script>
 <script>
 // ---- state ----
 let apiBase = document.getElementById('api-base').value;
@@ -218,6 +220,10 @@ let audioOnlyAutoFallbackEnabled = false;
 // every call. lastAudioStats/lastReportedQuality avoid re-sending the
 // same bucket to the peer on every 5s tick.
 let lastAudioStats = null, lastReportedQuality = null;
+// Epic §23 adaptive video quality -- the last tier we actually applied to
+// our own outbound video sender, so a repeated identical peer report
+// doesn't call getParameters/setParameters every 5s for nothing.
+let lastAppliedOutboundQuality = null;
 // Epic §22 front/rear camera switch -- which physical camera the local
 // video track is currently using. Toggled by flipCamera(); irrelevant on
 // desktop browsers with one camera (getUserMedia will just fail to find
@@ -479,10 +485,21 @@ async function handleSignal(msg) {
       refreshUserListButtons();
       stopRingingTimer();
       document.getElementById('call-status').textContent = 'Connecting...';
-      await setupPeerConnection(initialMedia === 'video');
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      send({ type: 'webrtc:offer', call_id: callId, to: otherId, sdp: { type: offer.type, sdp: offer.sdp } });
+      try {
+        await setupPeerConnection(initialMedia === 'video');
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        send({ type: 'webrtc:offer', call_id: callId, to: otherId, sdp: { type: offer.type, sdp: offer.sdp } });
+      } catch (e) {
+        // Epic §8: the callee already accepted (their side is live and
+        // waiting), so if OUR camera/mic grab fails here we can't just go
+        // quiet -- end the call so they aren't left hanging.
+        const info = mapMediaError(e);
+        console.warn('[call] call:accepted handler failed to acquire camera/mic', info.code, e);
+        send({ type: 'call:end', call_id: callId, to: otherId });
+        cleanupCall();
+        alert('Could not start call: ' + info.message);
+      }
       break;
     case 'webrtc:offer':
       // If `pc` already exists, this is a mid-call renegotiation offer
@@ -515,10 +532,11 @@ async function handleSignal(msg) {
       break;
     case 'call:network-quality':
       // The peer's report of how THEY'RE experiencing the call (epic
-      // §23) -- purely informational, doesn't drive any auto-behavior on
-      // this side. Logged for now; a fuller UI could show both
-      // directions side by side.
+      // §23). UPDATED: now actually acted on -- throttles our own
+      // outbound video encoding when they report fair/poor reception,
+      // restores full quality when they report good.
       console.log('[quality] peer reports', msg.quality);
+      applyOutboundVideoConstraints(msg.quality);
       break;
     case 'error':
       if (msg.code === 'consent_required') {
@@ -631,6 +649,13 @@ function stopRingingTimer() {
 }
 
 async function placeCall(id, name, media) {
+  // Epic §8 browser-compatibility check -- fail fast with a clear message
+  // rather than the confusing, deep-in-the-flow error a missing
+  // RTCPeerConnection/getUserMedia would otherwise produce.
+  if (!isWebRTCSupported()) {
+    alert('Your browser doesn\'t support video/voice calls. Please use a recent version of Chrome, Firefox, Edge, or Safari.');
+    return;
+  }
   callId = null; otherId = id; otherName = name;
   callingTargetId = id;
   initialMedia = media === 'audio' ? 'audio' : 'video';
@@ -656,13 +681,32 @@ async function acceptCall() {
   // accept with no consent:true, code consent_required) since a client-side
   // check alone could be bypassed the same way doctor-only initiation could.
   if (!document.getElementById('consent-checkbox').checked) return;
+  if (!isWebRTCSupported()) {
+    alert('Your browser doesn\'t support video/voice calls. Please use a recent version of Chrome, Firefox, Edge, or Safari.');
+    return;
+  }
   document.getElementById('incoming-modal').style.display = 'none';
   document.getElementById('call-peer-name').textContent = otherName;
   document.getElementById('call-status').textContent = 'Connecting...';
   document.getElementById('call-screen').style.display = 'block';
   isRemoteVideoOn = false;
   updateRemoteVideoVisibility();
-  await setupPeerConnection(initialMedia === 'video');
+  const acceptedCallId = callId, acceptedOtherId = otherId;
+  try {
+    await setupPeerConnection(initialMedia === 'video');
+  } catch (e) {
+    // Epic §8: previously an unhandled rejection here (camera/mic
+    // permission denied, no device, already in use) left this tab frozen
+    // on "Connecting..." AND the caller never learned the call wasn't
+    // happening -- call:accept was never sent, so they'd just ring until
+    // their own timeout. Reject cleanly instead.
+    const info = mapMediaError(e);
+    console.warn('[call] acceptCall failed to acquire camera/mic', info.code, e);
+    send({ type: 'call:reject', call_id: acceptedCallId, to: acceptedOtherId });
+    cleanupCall();
+    alert('Could not join call: ' + info.message);
+    return;
+  }
   send({ type: 'call:accept', call_id: callId, to: otherId, consent: true, platform: 'web' });
 }
 
@@ -731,7 +775,36 @@ function stopStatsMonitor() {
   lastVideoStats = null;
   lastAudioStats = null;
   lastReportedQuality = null;
+  lastAppliedOutboundQuality = null;
   updateNetworkQualityIndicator(null);
+}
+
+// Epic §23: apply the peer-reported quality tier to our own outbound
+// video encoding -- see video-quality-adaptation.js for the constraint
+// table and why this reacts to the PEER's report (call:network-quality
+// received from them), not our own outbound-facing view of the call.
+// No-ops cleanly if there's no live video sender (audio-only call, or
+// video not yet added).
+async function applyOutboundVideoConstraints(quality) {
+  if (lastAppliedOutboundQuality === quality) return;
+  if (!pc) return;
+  const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+  if (!sender) return;
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    const constraints = getVideoEncodingConstraints(quality);
+    params.encodings[0].maxBitrate = constraints.maxBitrate;
+    params.encodings[0].scaleResolutionDownBy = constraints.scaleResolutionDownBy;
+    await sender.setParameters(params);
+    lastAppliedOutboundQuality = quality;
+  } catch (e) {
+    // Best-effort -- a failure here degrades to "video stays at whatever
+    // quality it already was," never breaks the call itself.
+    console.warn('[call] failed to apply adaptive video quality', e);
+  }
 }
 
 function updateNetworkQualityIndicator(quality) {
@@ -840,7 +913,18 @@ async function switchToVideo() {
     return;
   }
 
-  const camStream = await navigator.mediaDevices.getUserMedia({ video: true });
+  let camStream;
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({ video: true });
+  } catch (e) {
+    // Epic §8: a failed mid-call camera grab (permission revoked, camera
+    // taken by another app since the call started) previously threw here
+    // uncaught -- the call must survive this, just stay audio-only.
+    const info = mapMediaError(e);
+    console.warn('[call] switchToVideo failed to acquire camera', info.code, e);
+    alert('Could not switch to video: ' + info.message);
+    return;
+  }
   const videoTrack = camStream.getVideoTracks()[0];
   if (!videoTrack) return;
   pc.addTrack(videoTrack, camStream);

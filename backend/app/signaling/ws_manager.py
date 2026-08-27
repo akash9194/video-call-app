@@ -516,6 +516,14 @@ async def handle_message(
         )
         await emit_event("call_initiated", call_id=call_id, caller_id=sender_id, callee_id=callee_id, caller_role=sender_role, media=media)
 
+        # Epic §11/§3: patient-facing identity masking (see Settings.
+        # mask_clinician_identity_from_patient). Only the string sent to
+        # the callee changes -- the call record itself (caller_id,
+        # analytics events, call history for the doctor) always keeps the
+        # real identity; this doesn't touch the audit trail, only what's
+        # displayed to the patient during and around the call.
+        patient_facing_caller_name = "iLive Care Team" if settings.mask_clinician_identity_from_patient else sender_name
+
         # Ring every device the callee is connected on.
         delivered = await manager.send_to_all_devices(
             callee_id,
@@ -523,7 +531,7 @@ async def handle_message(
                 "type": "call:incoming",
                 "call_id": call_id,
                 "from": sender_id,
-                "from_name": sender_name,
+                "from_name": patient_facing_caller_name,
                 "media": media,
             },
         )

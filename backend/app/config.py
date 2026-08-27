@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     # fallback_occurred). Flip to true only once that approval exists.
     audio_only_auto_fallback_enabled: bool = False
 
+    # Epic §11/§3: "iLive Care Team"-only identity option. Off by default
+    # -- current behavior (the patient sees the clinician's real name) is
+    # preserved unless explicitly turned on, same "build it, gate it off,
+    # let Business/Medical actually decide" pattern as audio_only_auto_
+    # fallback_enabled above. Only affects what the PATIENT sees: the
+    # doctor's own call history, notes, and audit trail always keep the
+    # real identity regardless of this flag -- this masks a display
+    # string sent to the callee, not the underlying record.
+    mask_clinician_identity_from_patient: bool = False
+
     # Epic §35: alerting layer on top of the structured logging/analytics
     # in app/analytics.py. Empty by default -- alerts still get logged at
     # ERROR and persisted to alerts_collection either way (see

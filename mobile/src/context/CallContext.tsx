@@ -7,6 +7,8 @@ import { signalingClient } from '../services/signaling';
 import { api } from '../services/api';
 import { createPeerConnection, getLocalStream, switchCamera, RTCIceCandidate, RTCSessionDescription } from '../services/webrtc';
 import { bucketNetworkQuality, NetworkQuality } from '../services/networkQuality';
+import { getVideoEncodingConstraints } from '../services/videoQualityAdaptation';
+import { mapMediaError } from '../services/mediaErrors';
 import { CallStatus, CallMedia, SignalingMessage } from '../types';
 import { navigate } from '../navigation';
 import { useAuth } from './AuthContext';
@@ -91,6 +93,12 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   // read by finishCall() below, reset alongside everything else in
   // resetCallState().
   const everConnectedRef = useRef(false);
+  // Epic §23: the last quality tier we actually applied to our outbound
+  // video sender, so a repeated identical call:network-quality report
+  // (the peer polls every 5s, same as we do) doesn't call
+  // getParameters/setParameters on every single report -- only on an
+  // actual tier change.
+  const lastAppliedOutboundQualityRef = useRef<NetworkQuality | null>(null);
   const callIdRef = useRef<string | null>(null);
   const remoteUserIdRef = useRef<string | null>(null);
   const isVideoOnRef = useRef(false);
@@ -219,7 +227,37 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     setIsRemoteVideoOn(false);
     setIsSpeakerOn(false);
     everConnectedRef.current = false;
+    lastAppliedOutboundQualityRef.current = null;
     InCallManager.stop();
+  };
+
+  // Epic §23: apply the peer-reported quality tier to our own outbound
+  // video encoding -- see videoQualityAdaptation.ts for the constraint
+  // table and why this reacts to the PEER's report (call:network-
+  // quality received from them) rather than our own outbound-facing
+  // view of the call. No-ops cleanly if there's no live video sender
+  // (audio-only call, or video not yet added) -- nothing to throttle.
+  const applyOutboundVideoConstraints = async (quality: NetworkQuality) => {
+    if (lastAppliedOutboundQualityRef.current === quality) return;
+    const pc = pcRef.current;
+    if (!pc) return;
+    const sender = pc.getSenders().find((s: any) => s.track && s.track.kind === 'video');
+    if (!sender) return;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{ active: true }];
+      }
+      const constraints = getVideoEncodingConstraints(quality);
+      params.encodings[0].maxBitrate = constraints.maxBitrate;
+      params.encodings[0].scaleResolutionDownBy = constraints.scaleResolutionDownBy;
+      await sender.setParameters(params);
+      lastAppliedOutboundQualityRef.current = quality;
+    } catch (e) {
+      // Best-effort -- a failure here degrades to "video stays at
+      // whatever quality it already was," never breaks the call itself.
+      console.warn('[call] failed to apply adaptive video quality', e);
+    }
   };
 
   // Epic §30: the single place every "this call is over" path routes
@@ -306,7 +344,30 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     const defaultSpeaker = initialMediaRef.current === 'video';
     InCallManager.setSpeakerphoneOn(defaultSpeaker);
     setIsSpeakerOn(defaultSpeaker);
-    await setupPeerConnection(remoteUserId, callId, initialMediaRef.current);
+    try {
+      await setupPeerConnection(remoteUserId, callId, initialMediaRef.current);
+    } catch (e) {
+      // Epic §8: previously an unhandled rejection here (camera/mic
+      // permission denied, no device, already in use by another app)
+      // left this device frozen on "Connecting..." AND, worse, the
+      // caller was never told anything -- call:accept was never sent, so
+      // they'd just sit there ringing until their own timeout. Reject
+      // cleanly instead so the caller finds out immediately, and tell
+      // this user what actually went wrong.
+      const info = mapMediaError(e);
+      console.warn('[call] acceptCall failed to acquire camera/mic', info.code, e);
+      // call:reject doesn't currently distinguish *why* the callee didn't
+      // join (it always records PATIENT_DECLINED) -- teaching the backend
+      // to trust a client-supplied reason is a separate, bigger change
+      // with its own trust implications, out of scope here. What matters
+      // most is fixed: the caller gets told immediately instead of
+      // ringing into a void.
+      signalingClient.send({ type: 'call:reject', call_id: callId, to: remoteUserId });
+      resetCallState();
+      navigate('Home');
+      Alert.alert('Could not join call', info.message);
+      return;
+    }
     signalingClient.send({ type: 'call:accept', call_id: callId, to: remoteUserId, consent: true, platform: Platform.OS });
     // Offer will arrive from the caller next; we answer it in the message handler.
   };
@@ -370,7 +431,19 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     }
 
     // No video track yet -- get the camera and add it, then renegotiate.
-    const cameraStream = await getLocalStream(true);
+    let cameraStream: MediaStream;
+    try {
+      cameraStream = await getLocalStream(true);
+    } catch (e) {
+      // Epic §8: a failed mid-call camera grab (permission revoked,
+      // camera taken by another app since the call started) previously
+      // threw here uncaught -- the call itself must survive this, just
+      // stay audio-only and tell the user why the switch didn't happen.
+      const info = mapMediaError(e);
+      console.warn('[call] switchToVideo failed to acquire camera', info.code, e);
+      Alert.alert('Could not switch to video', info.message);
+      return;
+    }
     const videoTrack = cameraStream.getVideoTracks()[0];
     if (!videoTrack) return;
     pc.addTrack(videoTrack, cameraStream);
@@ -415,7 +488,14 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           setRemoteUserId(msg.from);
           setRemoteUserName(msg.from_name);
           setStatus('incoming');
-          InCallManager.startRingtone('_DEFAULT_');
+          // react-native-incall-manager's own .d.ts marks vibrate_pattern/
+          // ios_category/seconds as required, but the library's actual JS
+          // implementation treats all three as optional (defaults: no
+          // vibration, "default" iOS category, infinite looping on
+          // Android) -- calling with just the ringtone name is correct
+          // and has always been the intended usage here; this is purely
+          // an upstream type-stub inaccuracy, not a real missing-args bug.
+          (InCallManager.startRingtone as (ringtone: string) => void)('_DEFAULT_');
           navigate('IncomingCall', {
             callId: msg.call_id,
             fromUserId: msg.from,
@@ -441,16 +521,30 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           InCallManager.setSpeakerphoneOn(defaultSpeaker);
           setIsSpeakerOn(defaultSpeaker);
           setStatus('connecting');
-          const pc = await setupPeerConnection(remoteUserId, acceptedCallId, initialMediaRef.current);
-          const offer = await pc.createOffer({});
-          await pc.setLocalDescription(offer);
-          signalingClient.send({ type: 'webrtc:offer', call_id: acceptedCallId, to: remoteUserId, sdp: offer });
-          navigate('Call', {
-            callId: acceptedCallId,
-            remoteUserId,
-            remoteUserName: remoteUserName || '',
-            isCaller: true,
-          });
+          try {
+            const pc = await setupPeerConnection(remoteUserId, acceptedCallId, initialMediaRef.current);
+            const offer = await pc.createOffer({});
+            await pc.setLocalDescription(offer);
+            signalingClient.send({ type: 'webrtc:offer', call_id: acceptedCallId, to: remoteUserId, sdp: offer });
+            navigate('Call', {
+              callId: acceptedCallId,
+              remoteUserId,
+              remoteUserName: remoteUserName || '',
+              isCaller: true,
+            });
+          } catch (e) {
+            // Epic §8: the callee already accepted (their side is live
+            // and waiting), so if OUR camera/mic grab fails here we can't
+            // just go quiet -- previously this was an unhandled
+            // rejection that left both sides stuck. End the call so the
+            // callee isn't left hanging, and tell this side why.
+            const info = mapMediaError(e);
+            console.warn('[call] call:accepted handler failed to acquire camera/mic', info.code, e);
+            signalingClient.send({ type: 'call:end', call_id: acceptedCallId, to: remoteUserId });
+            resetCallState();
+            navigate('Home');
+            Alert.alert('Could not start call', info.message);
+          }
           break;
         }
 
@@ -512,10 +606,12 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
 
         case 'call:network-quality': {
           // The peer's report of how THEY'RE experiencing the call (epic
-          // §23) -- purely informational today, doesn't drive any
-          // auto-behavior on this side (that stays scoped to our own
-          // outbound view, set in startStatsMonitor above).
+          // §23). UPDATED: now actually acted on, not just logged --
+          // throttles our own outbound video encoding when they report
+          // fair/poor reception, restores full quality when they report
+          // good. See applyOutboundVideoConstraints above.
           console.log('[call] peer reports network quality:', msg.quality);
+          applyOutboundVideoConstraints(msg.quality);
           break;
         }
 

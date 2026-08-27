@@ -113,4 +113,9 @@ if __name__ == "__main__":
     # 0.0.0.0, not 127.0.0.1: lets other devices on the same wifi (e.g. a
     # phone running Safari against the web test client) reach this server
     # by the machine's LAN IP, not just localhost on this machine.
-    uvicorn.run(app, host="0.0.0.0", port=8123, log_level="warning")
+    # Port is overridable via MOCK_SERVER_PORT -- scripts/verify_identity_
+    # masking.py needs two server instances with different Settings (env
+    # is read once at process start), so it launches two subprocesses on
+    # different ports rather than trying to reconfigure one running server.
+    port = int(os.environ.get("MOCK_SERVER_PORT", "8123"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")

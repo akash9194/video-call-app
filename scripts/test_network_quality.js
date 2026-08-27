@@ -66,6 +66,37 @@ for (const { lossRatio, expected } of cases) {
   check(`web and mobile agree for lossRatio=${lossRatio}`, webResult === mobileResult);
 }
 
+// -- Epic §23 adaptive video quality: same cross-client parity check,
+// for getVideoEncodingConstraints (web-test-client/video-quality-
+// adaptation.js vs mobile/src/services/videoQualityAdaptation.ts).
+const { getVideoEncodingConstraints: webConstraints } = require(path.join(__dirname, '..', 'web-test-client', 'video-quality-adaptation.js'));
+
+const vqaSource = fs.readFileSync(path.join(__dirname, '..', 'mobile', 'src', 'services', 'videoQualityAdaptation.ts'), 'utf8');
+const vqaStripped = vqaSource
+  .replace(/^import[^\n]*\n/m, '')
+  .replace(/export interface VideoEncodingConstraints[^}]*}\n/, '')
+  .replace(/export function getVideoEncodingConstraints\(quality: NetworkQuality\): VideoEncodingConstraints/, 'function getVideoEncodingConstraints(quality)')
+  + '\nmodule.exports = { getVideoEncodingConstraints };\n';
+const vqaSandbox = { module: { exports: {} } };
+vm.createContext(vqaSandbox);
+vm.runInContext(vqaStripped, vqaSandbox, { filename: 'videoQualityAdaptation.ts (stripped)' });
+const mobileConstraints = vqaSandbox.module.exports.getVideoEncodingConstraints;
+
+check('mobile videoQualityAdaptation.ts loaded and evaluated successfully', typeof mobileConstraints === 'function');
+
+const qualityTiers = ['good', 'fair', 'poor', 'unknown'];
+for (const quality of qualityTiers) {
+  const webResult = webConstraints(quality);
+  const mobileResult = mobileConstraints(quality);
+  const same = webResult.maxBitrate === mobileResult.maxBitrate && webResult.scaleResolutionDownBy === mobileResult.scaleResolutionDownBy;
+  check(`web and mobile agree on encoding constraints for quality='${quality}'`, same);
+}
+check('good quality applies no cap (maxBitrate null)', webConstraints('good').maxBitrate === null);
+check('fair quality caps bitrate below good', webConstraints('fair').maxBitrate < 2_000_000 && webConstraints('fair').maxBitrate > 0);
+check('poor quality caps bitrate lower than fair', webConstraints('poor').maxBitrate < webConstraints('fair').maxBitrate);
+check('poor quality downscales resolution more than fair', webConstraints('poor').scaleResolutionDownBy > webConstraints('fair').scaleResolutionDownBy);
+check('unknown quality does not throttle (treated like good)', webConstraints('unknown').maxBitrate === null);
+
 console.log('\n' + '='.repeat(60));
 console.log(`RESULT: ${results.pass.length} passed, ${results.fail.length} failed`);
 if (results.fail.length) console.log('Failed:', results.fail);
