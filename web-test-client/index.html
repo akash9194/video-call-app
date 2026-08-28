@@ -74,6 +74,9 @@
   #call-topbar { position: absolute; top: 20px; left: 16px; z-index: 2; }
   #call-controls { position: absolute; bottom: 40px; left: 0; right: 0; display: flex; justify-content: center; gap: 20px; z-index: 2; }
   .ctrl-btn { width: auto; padding: 14px 20px; border-radius: 30px; background: rgba(255,255,255,0.15); }
+  #device-picker { position: absolute; bottom: 96px; left: 0; right: 0; display: none; justify-content: center; gap: 10px; z-index: 2; }
+  #device-picker select { max-width: 160px; font-size: 11px; padding: 6px 8px; border-radius: 8px; border: none; background: rgba(255,255,255,0.15); color: white; }
+  #device-picker select option { background: #1e293b; color: white; }
   #incoming-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); align-items: center; justify-content: center; flex-direction: column; gap: 16px; z-index: 10; }
   .avatar { width: 72px; height: 72px; border-radius: 50%; background: #2563eb; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 700; }
 </style>
@@ -181,6 +184,10 @@
     <div id="call-status" style="color:#94a3b8; font-size:13px"></div>
     <div id="network-quality" style="font-size:12px; display:none; margin-top:2px"></div>
   </div>
+  <div id="device-picker">
+    <select id="camera-select" onchange="switchCameraDevice(this.value)" title="Camera"></select>
+    <select id="mic-select" onchange="switchMicDevice(this.value)" title="Microphone"></select>
+  </div>
   <div id="call-controls">
     <button class="ctrl-btn" onclick="toggleMute()" id="mute-btn">Mute</button>
     <button class="ctrl-btn danger" style="border-radius:30px" onclick="endCall()">End</button>
@@ -229,6 +236,14 @@ let lastAppliedOutboundQuality = null;
 // desktop browsers with one camera (getUserMedia will just fail to find
 // the other facingMode, handled gracefully below).
 let currentFacingMode = 'user';
+// Epic §10 camera/mic device picker -- which specific input device (by
+// deviceId, not just facingMode) is currently feeding the call. Distinct
+// from flipCamera()/currentFacingMode above: that toggles front/rear on
+// devices exposing facingMode (mostly mobile browsers), this picks a
+// specific device out of navigator.mediaDevices.enumerateDevices() (mainly
+// useful on desktop, where someone may have 2+ webcams/mics plugged in).
+// The two controls can coexist -- flip is a shortcut, the picker is exact.
+let currentCameraDeviceId = null, currentMicDeviceId = null;
 
 // A stable per-browser device_id, persisted across reloads, is what lets a
 // dropped WebSocket reconnect as the SAME device server-side (see
@@ -733,6 +748,16 @@ async function setupPeerConnection(wantVideo) {
   isVideoOn = !!wantVideo;
   updateLocalVideoVisibility();
   updateSwitchButton();
+  // Epic §10: remember which exact devices we ended up on (the browser
+  // picks defaults when getUserMedia isn't given a deviceId constraint) so
+  // the picker below can show them as selected, and so switchCameraDevice/
+  // switchMicDevice know what NOT to bother re-requesting if the user picks
+  // the same device they're already using.
+  const startVideoTrack = localStream.getVideoTracks()[0];
+  const startAudioTrack = localStream.getAudioTracks()[0];
+  currentCameraDeviceId = startVideoTrack ? (startVideoTrack.getSettings().deviceId || null) : null;
+  currentMicDeviceId = startAudioTrack ? (startAudioTrack.getSettings().deviceId || null) : null;
+  populateDevicePickers();
 
   const remoteStream = new MediaStream();
   document.getElementById('remote-video').srcObject = remoteStream;
@@ -750,6 +775,101 @@ async function setupPeerConnection(wantVideo) {
     document.getElementById('call-status').textContent = pc.connectionState;
   };
   startStatsMonitor();
+}
+
+// ---- Epic §10: camera/mic device picker (web-only -- mobile has no
+// equivalent OS-level "pick this exact USB webcam" API without a native
+// module, so this stays scoped to the browser test client). ----
+
+// Labels are only populated by the browser once getUserMedia has been
+// granted at least once in this session, which is always true by the time
+// this runs (setupPeerConnection calls it right after its own
+// getUserMedia). Re-run on 'devicechange' too, so plugging in/unplugging a
+// USB webcam or headset mid-call updates the lists live.
+async function populateDevicePickers() {
+  if (!pc || !localStream) return; // call already ended before this resolved
+  let devices;
+  try {
+    devices = await navigator.mediaDevices.enumerateDevices();
+  } catch (e) {
+    console.warn('[device-picker] enumerateDevices failed', e);
+    return;
+  }
+  const cameras = devices.filter(d => d.kind === 'videoinput');
+  const mics = devices.filter(d => d.kind === 'audioinput');
+
+  const camSelect = document.getElementById('camera-select');
+  const micSelect = document.getElementById('mic-select');
+  fillDeviceSelect(camSelect, cameras, currentCameraDeviceId, 'Camera');
+  fillDeviceSelect(micSelect, mics, currentMicDeviceId, 'Microphone');
+
+  // Only show the camera dropdown on an active video call with >1 option
+  // (nothing useful to pick from a single camera / audio-only call), and
+  // only show the mic dropdown when there's actually a choice.
+  camSelect.style.display = (isVideoOn && cameras.length > 1) ? '' : 'none';
+  micSelect.style.display = (mics.length > 1) ? '' : 'none';
+  document.getElementById('device-picker').style.display =
+    (camSelect.style.display !== 'none' || micSelect.style.display !== 'none') ? 'flex' : 'none';
+}
+
+function fillDeviceSelect(selectEl, deviceList, selectedId, kindLabel) {
+  const prevValue = selectEl.value;
+  selectEl.innerHTML = '';
+  deviceList.forEach((d, i) => {
+    const opt = document.createElement('option');
+    opt.value = d.deviceId;
+    // Browsers omit .label until permission is granted; by the time this
+    // runs we already have it, but fall back to a numbered placeholder
+    // just in case (e.g. a device that came and went before it resolved).
+    opt.textContent = d.label || `${kindLabel} ${i + 1}`;
+    selectEl.appendChild(opt);
+  });
+  const target = selectedId && deviceList.some(d => d.deviceId === selectedId) ? selectedId : prevValue;
+  if (target && deviceList.some(d => d.deviceId === target)) selectEl.value = target;
+}
+
+async function switchCameraDevice(deviceId) {
+  if (!pc || !localStream || !deviceId || deviceId === currentCameraDeviceId) return;
+  const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId } } });
+    const newTrack = newStream.getVideoTracks()[0];
+    const oldTrack = localStream.getVideoTracks()[0];
+    if (sender) await sender.replaceTrack(newTrack);
+    if (oldTrack) { localStream.removeTrack(oldTrack); oldTrack.stop(); }
+    localStream.addTrack(newTrack);
+    document.getElementById('local-video').srcObject = localStream;
+    currentCameraDeviceId = newTrack.getSettings().deviceId || deviceId;
+  } catch (e) {
+    const info = mapMediaError(e);
+    console.warn('[device-picker] switchCameraDevice failed', info.code, e);
+    alert('Could not switch camera: ' + info.message);
+    populateDevicePickers(); // snap the dropdown back to what's actually active
+  }
+}
+
+async function switchMicDevice(deviceId) {
+  if (!pc || !localStream || !deviceId || deviceId === currentMicDeviceId) return;
+  const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId } } });
+    const newTrack = newStream.getAudioTracks()[0];
+    newTrack.enabled = !isMuted; // preserve current mute state across the swap
+    const oldTrack = localStream.getAudioTracks()[0];
+    if (sender) await sender.replaceTrack(newTrack);
+    if (oldTrack) { localStream.removeTrack(oldTrack); oldTrack.stop(); }
+    localStream.addTrack(newTrack);
+    currentMicDeviceId = newTrack.getSettings().deviceId || deviceId;
+  } catch (e) {
+    const info = mapMediaError(e);
+    console.warn('[device-picker] switchMicDevice failed', info.code, e);
+    alert('Could not switch microphone: ' + info.message);
+    populateDevicePickers();
+  }
+}
+
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', () => { if (pc && localStream) populateDevicePickers(); });
 }
 
 // Polls WebRTC stats every 5s while a call has live video, and if the
@@ -933,6 +1053,8 @@ async function switchToVideo() {
   isVideoOn = true;
   updateLocalVideoVisibility();
   updateSwitchButton();
+  currentCameraDeviceId = videoTrack.getSettings().deviceId || null;
+  populateDevicePickers(); // the camera dropdown was hidden while audio-only
 
   send({ type: 'call:media-switch', call_id: callId, to: otherId, media: 'video' });
 
@@ -950,6 +1072,7 @@ function switchToVoice(auto) {
   isVideoOn = false;
   updateLocalVideoVisibility();
   updateSwitchButton();
+  populateDevicePickers(); // hides the now-irrelevant camera dropdown
   send({ type: 'call:media-switch', call_id: callId, to: otherId, media: 'audio', ...(auto ? { auto: true } : {}) });
 }
 
@@ -972,6 +1095,11 @@ async function flipCamera() {
     localStream.addTrack(newTrack);
     document.getElementById('local-video').srcObject = localStream;
     currentFacingMode = nextFacingMode;
+    // Keep the §10 device picker in sync -- flipping camera swapped the
+    // active video device out from under it via facingMode, not via the
+    // dropdown, so its notion of "current" device is now stale.
+    currentCameraDeviceId = newTrack.getSettings().deviceId || null;
+    populateDevicePickers();
   } catch (e) {
     // Most common cause on a laptop/desktop: there's only one camera, so
     // the opposite facingMode doesn't exist. Not an error worth alarming
@@ -998,6 +1126,10 @@ function cleanupCall() {
   callId = null; otherId = null; otherName = null;
   callingTargetId = null;
   currentFacingMode = 'user';
+  currentCameraDeviceId = null; currentMicDeviceId = null;
+  document.getElementById('device-picker').style.display = 'none';
+  document.getElementById('camera-select').innerHTML = '';
+  document.getElementById('mic-select').innerHTML = '';
   isMuted = false; isVideoOn = false; isRemoteVideoOn = false;
   document.getElementById('mute-btn').textContent = 'Mute';
   updateSwitchButton();
