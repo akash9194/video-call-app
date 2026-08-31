@@ -187,6 +187,7 @@
   <div id="device-picker">
     <select id="camera-select" onchange="switchCameraDevice(this.value)" title="Camera"></select>
     <select id="mic-select" onchange="switchMicDevice(this.value)" title="Microphone"></select>
+    <select id="speaker-select" onchange="switchSpeakerDevice(this.value)" title="Speaker"></select>
   </div>
   <div id="call-controls">
     <button class="ctrl-btn" onclick="toggleMute()" id="mute-btn">Mute</button>
@@ -244,6 +245,16 @@ let currentFacingMode = 'user';
 // useful on desktop, where someone may have 2+ webcams/mics plugged in).
 // The two controls can coexist -- flip is a shortcut, the picker is exact.
 let currentCameraDeviceId = null, currentMicDeviceId = null;
+// Epic §22 speaker/audio-output device selection -- which device the
+// REMOTE party's audio plays out of (the local-video element is muted, so
+// there's nothing to route there; this is purely about where you hear the
+// other person). Uses the Audio Output Devices API (HTMLMediaElement.
+// setSinkId), which not every browser supports (notably Firefox and
+// Safari, as of this being written) -- SPEAKER_OUTPUT_SUPPORTED is checked
+// once at load and the picker stays hidden entirely on browsers that don't
+// have it, rather than showing a control that would just throw.
+const SPEAKER_OUTPUT_SUPPORTED = typeof HTMLMediaElement !== 'undefined' && typeof HTMLMediaElement.prototype.setSinkId === 'function';
+let currentSpeakerDeviceId = null;
 
 // A stable per-browser device_id, persisted across reloads, is what lets a
 // dropped WebSocket reconnect as the SAME device server-side (see
@@ -797,19 +808,24 @@ async function populateDevicePickers() {
   }
   const cameras = devices.filter(d => d.kind === 'videoinput');
   const mics = devices.filter(d => d.kind === 'audioinput');
+  const speakers = devices.filter(d => d.kind === 'audiooutput');
 
   const camSelect = document.getElementById('camera-select');
   const micSelect = document.getElementById('mic-select');
+  const speakerSelect = document.getElementById('speaker-select');
   fillDeviceSelect(camSelect, cameras, currentCameraDeviceId, 'Camera');
   fillDeviceSelect(micSelect, mics, currentMicDeviceId, 'Microphone');
+  if (SPEAKER_OUTPUT_SUPPORTED) fillDeviceSelect(speakerSelect, speakers, currentSpeakerDeviceId, 'Speaker');
 
   // Only show the camera dropdown on an active video call with >1 option
   // (nothing useful to pick from a single camera / audio-only call), and
-  // only show the mic dropdown when there's actually a choice.
+  // only show the mic/speaker dropdowns when there's actually a choice --
+  // speaker additionally requires the browser to support setSinkId at all.
   camSelect.style.display = (isVideoOn && cameras.length > 1) ? '' : 'none';
   micSelect.style.display = (mics.length > 1) ? '' : 'none';
+  speakerSelect.style.display = (SPEAKER_OUTPUT_SUPPORTED && speakers.length > 1) ? '' : 'none';
   document.getElementById('device-picker').style.display =
-    (camSelect.style.display !== 'none' || micSelect.style.display !== 'none') ? 'flex' : 'none';
+    (camSelect.style.display !== 'none' || micSelect.style.display !== 'none' || speakerSelect.style.display !== 'none') ? 'flex' : 'none';
 }
 
 function fillDeviceSelect(selectEl, deviceList, selectedId, kindLabel) {
@@ -865,6 +881,26 @@ async function switchMicDevice(deviceId) {
     console.warn('[device-picker] switchMicDevice failed', info.code, e);
     alert('Could not switch microphone: ' + info.message);
     populateDevicePickers();
+  }
+}
+
+// Unlike switchCameraDevice/switchMicDevice, this never touches
+// getUserMedia or the peer connection at all -- setSinkId() just tells an
+// already-playing <audio>/<video> element which physical output to render
+// through, no new stream/track/renegotiation involved. Applied to
+// remote-video only: that's the only element with audio anyone actually
+// hears (local-video is muted, it's just the self-preview).
+async function switchSpeakerDevice(deviceId) {
+  if (!SPEAKER_OUTPUT_SUPPORTED || !deviceId || deviceId === currentSpeakerDeviceId) return;
+  const remoteVideoEl = document.getElementById('remote-video');
+  try {
+    await remoteVideoEl.setSinkId(deviceId);
+    currentSpeakerDeviceId = deviceId;
+  } catch (e) {
+    const info = mapMediaError(e);
+    console.warn('[device-picker] switchSpeakerDevice failed', info.code, e);
+    alert('Could not switch speaker: ' + info.message);
+    populateDevicePickers(); // snap the dropdown back to what's actually active
   }
 }
 
@@ -1126,10 +1162,11 @@ function cleanupCall() {
   callId = null; otherId = null; otherName = null;
   callingTargetId = null;
   currentFacingMode = 'user';
-  currentCameraDeviceId = null; currentMicDeviceId = null;
+  currentCameraDeviceId = null; currentMicDeviceId = null; currentSpeakerDeviceId = null;
   document.getElementById('device-picker').style.display = 'none';
   document.getElementById('camera-select').innerHTML = '';
   document.getElementById('mic-select').innerHTML = '';
+  document.getElementById('speaker-select').innerHTML = '';
   isMuted = false; isVideoOn = false; isRemoteVideoOn = false;
   document.getElementById('mute-btn').textContent = 'Mute';
   updateSwitchButton();

@@ -62,12 +62,14 @@ function makeOption() {
   return { value: '', textContent: '' };
 }
 
-function buildSandbox({ cameras, mics, getUserMediaImpl }) {
+function buildSandbox({ cameras, mics, speakers = [], getUserMediaImpl, setSinkIdImpl, speakerSupported = true }) {
   const els = {
     'device-picker': makeEl(),
     'camera-select': makeEl(),
     'mic-select': makeEl(),
+    'speaker-select': makeEl(),
     'local-video': { srcObject: null },
+    'remote-video': { setSinkId: setSinkIdImpl || (async () => {}) },
   };
 
   const fakeDocument = {
@@ -82,7 +84,7 @@ function buildSandbox({ cameras, mics, getUserMediaImpl }) {
     document: fakeDocument,
     navigator: {
       mediaDevices: {
-        enumerateDevices: async () => [...cameras, ...mics],
+        enumerateDevices: async () => [...cameras, ...mics, ...speakers],
         getUserMedia: getUserMediaImpl,
       },
     },
@@ -96,6 +98,12 @@ function buildSandbox({ cameras, mics, getUserMediaImpl }) {
     isMuted: false,
     currentCameraDeviceId: null,
     currentMicDeviceId: null,
+    // §22: normally computed once from `typeof HTMLMediaElement...` at
+    // module load; seeded directly here since the sandbox has no real
+    // HTMLMediaElement to detect against. speakerSupported: false lets a
+    // test prove the picker stays inert on browsers without setSinkId.
+    SPEAKER_OUTPUT_SUPPORTED: speakerSupported,
+    currentSpeakerDeviceId: null,
   };
   sandbox.mapMediaError = require(path.join(__dirname, '..', 'web-test-client', 'media-errors.js')).mapMediaError;
   vm.createContext(sandbox);
@@ -283,6 +291,103 @@ async function main() {
     check('switchCameraDevice surfaces a friendly alert mentioning the mapped error message', sb.__alerts.some(a => a.includes('Could not switch camera') && a.length > 'Could not switch camera: '.length));
     check('the old (still-working) camera track was left alone, not stopped, on failure', oldTrack.stopped === false);
     check('currentCameraDeviceId is unchanged on failure (still cam-1, not silently advanced to cam-2)', sb.currentCameraDeviceId === 'cam-1');
+  }
+
+  const speakers = [
+    { kind: 'audiooutput', deviceId: 'spk-1', label: 'Built-in Speakers' },
+    { kind: 'audiooutput', deviceId: 'spk-2', label: 'USB Headset' },
+  ];
+
+  // ---------------------------------------------------------------
+  // 8. populateDevicePickers: speaker dropdown shown when supported + choice exists.
+  // ---------------------------------------------------------------
+  console.log('\n=== 8. populateDevicePickers: speaker picker shown ===');
+  {
+    const sb = buildSandbox({ cameras, mics, speakers, getUserMediaImpl: async () => { throw new Error('unused'); } });
+    sb.pc = {};
+    sb.localStream = fakeStream([fakeTrack('audio', 'mic-1')]);
+    sb.currentSpeakerDeviceId = 'spk-1';
+
+    await vm.runInContext('populateDevicePickers()', sb);
+    await new Promise(r => setTimeout(r, 0));
+
+    const speakerSelect = sb.__els['speaker-select'];
+    check('speaker select gets 2 options (2 speakers enumerated)', speakerSelect._options.length === 2);
+    check('speaker option labels come from device.label', speakerSelect._options.map(o => o.textContent).includes('USB Headset'));
+    check('speaker dropdown shown (2 speakers, browser supports setSinkId)', speakerSelect.style.display !== 'none');
+    check('device-picker container shown (speaker dropdown visible, even though this call has no video)', sb.__els['device-picker'].style.display === 'flex');
+  }
+
+  // ---------------------------------------------------------------
+  // 9. populateDevicePickers: speaker dropdown hidden when the browser
+  //    doesn't support setSinkId at all (Firefox/Safari as of writing).
+  // ---------------------------------------------------------------
+  console.log('\n=== 9. populateDevicePickers: unsupported browser ===');
+  {
+    const sb = buildSandbox({ cameras, mics, speakers, speakerSupported: false, getUserMediaImpl: async () => { throw new Error('unused'); } });
+    sb.pc = {};
+    sb.localStream = fakeStream([fakeTrack('audio', 'mic-1')]);
+
+    await vm.runInContext('populateDevicePickers()', sb);
+    await new Promise(r => setTimeout(r, 0));
+
+    const speakerSelect = sb.__els['speaker-select'];
+    check('speaker dropdown stays hidden when SPEAKER_OUTPUT_SUPPORTED is false, even with 2 speakers available', speakerSelect.style.display === 'none');
+    check('speaker options are not even built on an unsupported browser (no wasted enumeration work)', speakerSelect._options.length === 0);
+  }
+
+  // ---------------------------------------------------------------
+  // 10. switchSpeakerDevice: calls setSinkId on the remote-video element,
+  //     not getUserMedia/replaceTrack (no track/negotiation involved).
+  // ---------------------------------------------------------------
+  console.log('\n=== 10. switchSpeakerDevice: real switch ===');
+  {
+    let sinkIdCalledWith = null;
+    let gumCalls = 0;
+    const sb = buildSandbox({
+      cameras, mics, speakers,
+      getUserMediaImpl: async () => { gumCalls++; throw new Error('switchSpeakerDevice must never call getUserMedia'); },
+      setSinkIdImpl: async (id) => { sinkIdCalledWith = id; },
+    });
+    sb.currentSpeakerDeviceId = 'spk-1';
+
+    await vm.runInContext("switchSpeakerDevice('spk-2')", sb);
+    await new Promise(r => setTimeout(r, 0));
+
+    check('switchSpeakerDevice calls remote-video.setSinkId with the new device id', sinkIdCalledWith === 'spk-2');
+    check('switchSpeakerDevice never touches getUserMedia (no track/renegotiation needed for output routing)', gumCalls === 0);
+    check('switchSpeakerDevice updates currentSpeakerDeviceId', sb.currentSpeakerDeviceId === 'spk-2');
+  }
+
+  // ---------------------------------------------------------------
+  // 11. switchSpeakerDevice: same-device no-op, unsupported-browser no-op,
+  //     and a setSinkId failure is surfaced without throwing.
+  // ---------------------------------------------------------------
+  console.log('\n=== 11. switchSpeakerDevice: guards + error path ===');
+  {
+    let calls = 0;
+    const sb = buildSandbox({ cameras, mics, speakers, getUserMediaImpl: async () => { throw new Error('unused'); }, setSinkIdImpl: async () => { calls++; } });
+    sb.currentSpeakerDeviceId = 'spk-1';
+    await vm.runInContext("switchSpeakerDevice('spk-1')", sb);
+    await new Promise(r => setTimeout(r, 0));
+    check('switchSpeakerDevice no-ops when the target speaker is already active', calls === 0);
+
+    const sbUnsupported = buildSandbox({ cameras, mics, speakers, speakerSupported: false, getUserMediaImpl: async () => { throw new Error('unused'); }, setSinkIdImpl: async () => { calls++; } });
+    await vm.runInContext("switchSpeakerDevice('spk-2')", sbUnsupported);
+    await new Promise(r => setTimeout(r, 0));
+    check('switchSpeakerDevice no-ops on a browser without setSinkId support, even if called directly', calls === 0);
+
+    const sbFail = buildSandbox({
+      cameras, mics, speakers,
+      getUserMediaImpl: async () => { throw new Error('unused'); },
+      setSinkIdImpl: async () => { const e = new Error('no such device'); e.name = 'NotFoundError'; throw e; },
+    });
+    sbFail.currentSpeakerDeviceId = 'spk-1';
+    await vm.runInContext("switchSpeakerDevice('spk-2')", sbFail);
+    await new Promise(r => setTimeout(r, 0));
+    check('a setSinkId failure does not throw an unhandled rejection', true);
+    check('a setSinkId failure surfaces a friendly alert', sbFail.__alerts.some(a => a.includes('Could not switch speaker')));
+    check('currentSpeakerDeviceId is unchanged on a setSinkId failure', sbFail.currentSpeakerDeviceId === 'spk-1');
   }
 
   console.log('\n' + '='.repeat(60));
