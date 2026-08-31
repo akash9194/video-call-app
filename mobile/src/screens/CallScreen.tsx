@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native';
 import { RTCView } from 'react-native-webrtc';
 import { useCall } from '../context/CallContext';
 
@@ -21,10 +21,12 @@ export default function CallScreen() {
     isVideoOn,
     isRemoteVideoOn,
     isSpeakerOn,
+    isBluetoothOn,
     networkQuality,
     endCall,
     toggleMute,
     toggleSpeaker,
+    toggleBluetoothRoute,
     flipCamera,
     switchToVideo,
     switchToVoice,
@@ -68,6 +70,14 @@ export default function CallScreen() {
         <TouchableOpacity style={styles.controlButton} onPress={toggleSpeaker}>
           <Text style={styles.controlIcon}>{isSpeakerOn ? 'Speaker' : 'Earpiece'}</Text>
         </TouchableOpacity>
+        {/* Epic §22 Bluetooth route -- Android only (see toggleBluetoothRoute
+            in CallContext for why iOS can't do this via this library).
+            Hidden entirely on iOS rather than shown-and-always-fails. */}
+        {Platform.OS === 'android' && (
+          <TouchableOpacity style={styles.controlButton} onPress={toggleBluetoothRoute}>
+            <Text style={styles.controlIcon}>{isBluetoothOn ? 'Bluetooth ✓' : 'Bluetooth'}</Text>
+          </TouchableOpacity>
+        )}
         <TouchableOpacity style={[styles.controlButton, styles.endCall]} onPress={endCall}>
           <Text style={styles.controlIcon}>End</Text>
         </TouchableOpacity>

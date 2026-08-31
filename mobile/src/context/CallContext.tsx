@@ -9,6 +9,7 @@ import { createPeerConnection, getLocalStream, switchCamera, RTCIceCandidate, RT
 import { bucketNetworkQuality, NetworkQuality } from '../services/networkQuality';
 import { getVideoEncodingConstraints } from '../services/videoQualityAdaptation';
 import { mapMediaError } from '../services/mediaErrors';
+import { resolveAudioRoute } from '../services/audioRoute';
 import { CallStatus, CallMedia, SignalingMessage } from '../types';
 import { navigate } from '../navigation';
 import { useAuth } from './AuthContext';
@@ -24,6 +25,7 @@ interface CallContextValue {
   isVideoOn: boolean; // do we currently have a live local video track in this call?
   isRemoteVideoOn: boolean; // is the OTHER side currently sending video?
   isSpeakerOn: boolean; // epic §22 -- speaker vs earpiece routing
+  isBluetoothOn: boolean; // epic §22 -- Bluetooth audio route (Android only, see toggleBluetoothRoute)
   networkQuality: NetworkQuality | null; // epic §23 -- our own outbound-facing view of the call's quality
   callingElapsedSeconds: number; // epic §10 -- seconds spent ringing so far (0 unless status === 'calling')
   startCall: (calleeId: string, calleeName: string, media: CallMedia) => Promise<void>;
@@ -32,6 +34,7 @@ interface CallContextValue {
   endCall: () => void;
   toggleMute: () => void;
   toggleSpeaker: () => void;
+  toggleBluetoothRoute: () => Promise<void>;
   flipCamera: () => void;
   switchToVideo: () => Promise<void>;
   switchToVoice: (auto?: boolean) => void;
@@ -60,6 +63,18 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
   // this way, but doesn't expose a way to read the state back or let the
   // user override it -- this state + toggle is that explicit control.
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
+  // Epic §22 -- Bluetooth audio route, independent of the speaker/earpiece
+  // toggle above. Android only: confirmed by reading react-native-
+  // incall-manager's own source (node_modules, not guessed) that its
+  // Android native module really implements chooseAudioRoute('BLUETOOTH')
+  // (InCallManagerModule.java's AudioDevice enum), while the iOS native
+  // module (RNInCallManager.m) never exports a chooseAudioRoute method at
+  // all -- calling it there would reject. The library also doesn't expose
+  // any JS-level way to detect whether a Bluetooth headset is actually
+  // connected before offering this, so it's offered unconditionally on
+  // Android and fails gracefully (see toggleBluetoothRoute) if there's
+  // nothing to route to.
+  const [isBluetoothOn, setIsBluetoothOn] = useState(false);
   // Epic §10 ringing-duration timer -- seconds elapsed since we started
   // ringing (status === 'calling'), reset once we leave that state.
   const [callingElapsedSeconds, setCallingElapsedSeconds] = useState(0);
@@ -226,6 +241,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     setIsVideoOn(false);
     setIsRemoteVideoOn(false);
     setIsSpeakerOn(false);
+    setIsBluetoothOn(false);
     everConnectedRef.current = false;
     lastAppliedOutboundQualityRef.current = null;
     InCallManager.stop();
@@ -399,6 +415,31 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     const next = !isSpeakerOn;
     InCallManager.setSpeakerphoneOn(next);
     setIsSpeakerOn(next);
+  };
+
+  // Epic §22 Bluetooth audio route. See the isBluetoothOn declaration
+  // above for why this is Android-only and can't detect device
+  // availability up front. Turning it OFF routes back to whatever the
+  // speaker/earpiece toggle currently reflects, rather than a hardcoded
+  // choice, so the two controls compose the way a real phone's audio
+  // routing does (Bluetooth is an override on top of speaker/earpiece,
+  // not a third independent state that has to be reasoned about
+  // separately). A rejection here (most commonly: no Bluetooth audio
+  // device is actually paired/connected right now) is handled the same
+  // way flipCamera() handles "only one camera" -- logged, state left
+  // unchanged, no crash, no scary alert for something this routine.
+  const toggleBluetoothRoute = async () => {
+    if (Platform.OS !== 'android') {
+      Alert.alert('Not available', 'Bluetooth audio routing from this screen is only supported on Android right now.');
+      return;
+    }
+    const next = !isBluetoothOn;
+    try {
+      await InCallManager.chooseAudioRoute(resolveAudioRoute(next, isSpeakerOn));
+      setIsBluetoothOn(next);
+    } catch (e) {
+      console.warn('[call] chooseAudioRoute failed (likely no Bluetooth audio device connected):', e);
+    }
   };
 
   // Epic §22 front/rear camera flip. Only meaningful while a live local
@@ -750,6 +791,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         isVideoOn,
         isRemoteVideoOn,
         isSpeakerOn,
+        isBluetoothOn,
         networkQuality,
         callingElapsedSeconds,
         startCall,
@@ -758,6 +800,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         endCall,
         toggleMute,
         toggleSpeaker,
+        toggleBluetoothRoute,
         flipCamera,
         switchToVideo,
         switchToVoice,
