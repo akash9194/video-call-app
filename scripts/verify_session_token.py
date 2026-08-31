@@ -17,6 +17,18 @@ individually self-consistent), a non-participant is rejected, and the
 endpoint correctly refuses once the call has ended (409) -- a token for a
 call that's over isn't meaningful, by design (see the docstring on
 Settings.call_session_token).
+
+Part 3 (added this round) validates the token's first real consumer:
+GET /calls/{call_id}/events now accepts EITHER the existing JWT (unchanged
+-- proven by a regression check) OR an X-Call-Session-Token header alone,
+with no JWT at all. Confirms: token-only access works and returns the real
+event list; a garbage/tampered token is rejected (401); a token minted for
+a DIFFERENT call_id is rejected against this call's events (401) even
+though the signature itself is valid; a token that's technically valid but
+belongs to a non-participant is still blocked by the same 403 participant
+check the JWT path uses (proving the two auth paths funnel into one
+authorization check, not two separately-maintained ones); and no auth at
+all still gets a plain 401.
 """
 import asyncio
 import json
@@ -122,6 +134,14 @@ def part1_unit_tests():
     time.sleep(2.5)
     check("expired token is rejected", s.verify_call_session_token(token, "call-abc", "user-1") is False)
 
+    print("\n-- identity_from_call_session_token (the §28 events-endpoint consumer) --")
+    s2 = Settings(jwt_secret_key="unit-test-secret-2", call_session_token_ttl_seconds=30)
+    fresh_token, _ = s2.call_session_token("call-xyz", "user-42")
+    check("identity_from_call_session_token extracts the right user_id from a valid token", s2.identity_from_call_session_token(fresh_token, "call-xyz") == "user-42")
+    check("identity_from_call_session_token rejects a mismatched call_id (valid sig, wrong call)", s2.identity_from_call_session_token(fresh_token, "call-other") is None)
+    check("identity_from_call_session_token rejects garbage input without crashing", s2.identity_from_call_session_token("not:a:real:token:at-all-nope", "call-xyz") is None)
+    check("identity_from_call_session_token rejects an empty string without crashing", s2.identity_from_call_session_token("", "call-xyz") is None)
+
 
 async def part2_live_backend():
     print("\n=== Part 2: issuance against the real backend ===")
@@ -182,9 +202,68 @@ async def part2_live_backend():
         await p.ws.close()
 
 
+async def part3_events_endpoint_enforcement():
+    print("\n=== Part 3: GET /calls/{call_id}/events accepts a session token, no JWT ===")
+    verifier = Settings(jwt_secret_key=os.environ["JWT_SECRET_KEY"])
+
+    doc = signup("Dr. Enforce", "enforce.doc@example.com", "doctor")
+    pat = signup("Patient Enforce", "enforce.pat@example.com", "patient")
+    outsider = signup("Outsider Enforce", "enforce.outsider@example.com", "patient")
+    doc_id, pat_id = doc["user"]["id"], pat["user"]["id"]
+    requests.post(f"{BASE}/appointments", headers=auth_header(doc), json={"patient_id": pat_id, "scheduled_time": "2026-08-20T10:00:00Z"}).raise_for_status()
+
+    doctor = Peer("Doctor", doc["access_token"])
+    patient = Peer("Patient", pat["access_token"])
+    await asyncio.gather(doctor.connect(), patient.connect())
+    await asyncio.sleep(0.3)
+
+    await doctor.send({"type": "call:invite", "to": pat_id, "media": "video", "platform": "web"})
+    incoming = await patient.wait_for("call:incoming")
+    call_id = incoming["call_id"]
+    await patient.send({"type": "call:accept", "call_id": call_id, "to": doc_id, "consent": True, "platform": "web"})
+    await doctor.wait_for("call:accepted")
+    patient_token_msg = await patient.wait_for("call:session-token")
+    patient_session_token = patient_token_msg["token"]
+
+    await doctor.send({"type": "call:end", "call_id": call_id, "to": pat_id})
+    await patient.wait_for("call:ended")
+    await asyncio.sleep(0.3)  # let call:ended's analytics event actually land before querying it
+
+    print("  -- regression: the existing JWT-only path still works unchanged --")
+    jwt_resp = requests.get(f"{BASE}/calls/{call_id}/events", headers=auth_header(doc))
+    check("JWT-only auth on /events still returns 200 (unchanged behavior)", jwt_resp.status_code == 200)
+    jwt_events = jwt_resp.json() if jwt_resp.status_code == 200 else []
+    check("JWT-only auth returns a non-empty real event list", len(jwt_events) > 0)
+
+    print("  -- new: session-token-only auth, NO Authorization header at all --")
+    token_resp = requests.get(f"{BASE}/calls/{call_id}/events", headers={"X-Call-Session-Token": patient_session_token})
+    check("session-token-only auth (no JWT) returns 200", token_resp.status_code == 200)
+    token_events = token_resp.json() if token_resp.status_code == 200 else []
+    check("session-token-only auth returns the SAME events as the JWT path", token_events == jwt_events)
+
+    print("  -- rejection cases --")
+    no_auth_resp = requests.get(f"{BASE}/calls/{call_id}/events")
+    check("no credential at all -> 401", no_auth_resp.status_code == 401)
+
+    garbage_resp = requests.get(f"{BASE}/calls/{call_id}/events", headers={"X-Call-Session-Token": "not-a-real-token"})
+    check("garbage session token -> 401", garbage_resp.status_code == 401)
+
+    other_call_token, _ = verifier.call_session_token("some-other-call-id", pat_id)
+    wrong_call_resp = requests.get(f"{BASE}/calls/{call_id}/events", headers={"X-Call-Session-Token": other_call_token})
+    check("a validly-signed token for a DIFFERENT call_id -> 401 on this call's events", wrong_call_resp.status_code == 401)
+
+    outsider_token, _ = verifier.call_session_token(call_id, outsider["user"]["id"])
+    outsider_resp = requests.get(f"{BASE}/calls/{call_id}/events", headers={"X-Call-Session-Token": outsider_token})
+    check("a validly-signed token for a non-participant -> 403 (same participant check as the JWT path)", outsider_resp.status_code == 403)
+
+    for p in (doctor, patient):
+        await p.ws.close()
+
+
 async def main():
     part1_unit_tests()
     await part2_live_backend()
+    await part3_events_endpoint_enforcement()
 
     print("\n" + "=" * 60)
     print(f"RESULT: {len(results['pass'])} passed, {len(results['fail'])} failed")

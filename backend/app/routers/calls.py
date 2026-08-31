@@ -1,10 +1,10 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from app.config import settings
 from app.database import analytics_events_collection, calls_collection
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, get_current_user_optional
 from app.schemas.call import CallOut, CallNotesUpdate, CallSessionTokenResponse, IceServersResponse, OUTCOMES
 
 router = APIRouter(prefix="/calls", tags=["calls"])
@@ -101,7 +101,11 @@ async def add_call_notes(call_id: str, body: CallNotesUpdate, current_user: dict
 
 
 @router.get("/{call_id}/events")
-async def get_call_events(call_id: str, current_user: dict = Depends(get_current_user)):
+async def get_call_events(
+    call_id: str,
+    current_user: dict | None = Depends(get_current_user_optional),
+    x_call_session_token: str | None = Header(default=None, alias="X-Call-Session-Token"),
+):
     """
     Epic §36: queryable analytics events for a single call (call_initiated,
     call_connected, permission_denied, ...), emitted by
@@ -109,11 +113,31 @@ async def get_call_events(call_id: str, current_user: dict = Depends(get_current
     participants only -- there's no admin/operator role in this build yet,
     so this is the privacy-safe subset: you can see the event trail for
     calls you were actually on.
+
+    Epic §28's call-session token gets its first real consumer here: this
+    endpoint now accepts EITHER the normal JWT (unchanged -- every existing
+    caller keeps working exactly as before) OR an X-Call-Session-Token
+    header carrying the short-lived token minted for this exact call_id,
+    with no JWT at all. That's the scenario the token was built for --
+    something that legitimately needs to read one call's event trail
+    (an embedded widget, a future CallKit action handler) without being
+    handed the user's full, long-lived account credential. The token
+    itself already encodes which user it's for (see
+    Settings.identity_from_call_session_token), so no separate identity
+    lookup is needed on that path.
     """
+    if current_user is not None:
+        user_id = str(current_user["_id"])
+    elif x_call_session_token:
+        user_id = settings.identity_from_call_session_token(x_call_session_token, call_id)
+        if user_id is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired call session token")
+    else:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
     call = await calls_collection.find_one({"call_id": call_id})
     if not call:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found")
-    user_id = str(current_user["_id"])
     if user_id not in (call.get("caller_id"), call.get("callee_id")):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You weren't a participant on this call")
 

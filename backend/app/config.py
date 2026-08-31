@@ -170,6 +170,32 @@ class Settings(BaseSettings):
         except ValueError:
             return False
 
+    def identity_from_call_session_token(self, token: str, call_id: str) -> str | None:
+        """The "concrete consumer" referenced in call_session_token()'s
+        docstring above -- epic §28, closed this round. Unlike
+        verify_call_session_token() (which checks a token against a
+        user_id you already know, e.g. to double-check an already-JWT-
+        authenticated caller), this is for a caller that has ONLY the
+        call-scoped token and no JWT at all -- so there's no user_id to
+        check against yet. The token's payload already carries user_id
+        (see call_session_token()'s format), so this just reads it out of
+        the (still-unverified) token and hands both back to
+        verify_call_session_token() to do the actual signature/expiry
+        check, rather than duplicating that logic here. Returns the
+        verified user_id on success, None on any failure (malformed
+        token, wrong call_id, bad signature, expired) -- deliberately the
+        same shape as get_current_user_optional() upstream of this, so a
+        caller can't distinguish "no token" from "bad token" and go
+        probing for which one it was.
+        """
+        try:
+            t_user_id = token.split(":", 3)[1]
+        except (IndexError, AttributeError):
+            return None
+        if self.verify_call_session_token(token, call_id, t_user_id):
+            return t_user_id
+        return None
+
     def ice_servers(self, user_id: str) -> list[dict]:
         servers = [{"urls": [u.strip() for u in self.stun_urls.split(",") if u.strip()]}]
         if self.turn_urls:
